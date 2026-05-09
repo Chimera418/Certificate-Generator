@@ -4,6 +4,8 @@ A Flask application for event-based certificate distribution.
 
 Participants open an event page, validate their details against a CSV list, enter the name to print, preview the generated certificate, and download it as PNG.
 
+> **📖 Complete Documentation:** For detailed instructions on setting up events, using the Admin Dashboard, sending bulk emails, and understanding the directory structure, please read the [Comprehensive Guide](guide.md).
+
 ## Features
 
 - Multiple events with independent settings and participant lists

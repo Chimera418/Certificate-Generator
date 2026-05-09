@@ -89,15 +89,16 @@ python app.py
 ### Accessing the Site
 - **Public Portal:** `http://localhost:5000/` — Participants select an event, enter their email/name, and download their personalized PNG.
 - **Admin Dashboard:** `http://localhost:5000/admin` — Login with your `ADMIN_PASSWORD` from `.env`.
-    - From the dashboard, you can visually preview certificate layouts.
-    - You can adjust the `text_x`, `text_y`, and `font_size` using a live preview interface without editing the JSON manually.
-    - You can toggle events on/off.
+    - **Coordinate Editor:** Visually adjust the `text_x`, `text_y`, `font_size`, and font styles using a live, draggable preview.
+    - **Event Management:** Toggle events on/off or delete them entirely.
+    - **Bulk Email Delivery:** Click **Send Emails** to open a comprehensive email configuration panel. You can customize the Subject, Plain Text Body, and HTML Body with live variable injection (`{participant_name}`, `{event_name}`). Clicking send dispatches the emails in the background!
+    - **System Logs:** View real-time output of your background email tasks by clicking **View Logs** in the top navigation.
 
 ---
 
 ## 4. The Admin CLI (`manage.py`)
 
-For large-scale operations where you don't want participants downloading manually, you can use the CLI tool. Open a terminal and run `python manage.py <command>`.
+For large-scale operations or environments where you prefer the terminal, you can use the CLI tool. Open a terminal and run `python manage.py <command>`.
 
 ### Bulk Generate (Local Export)
 If you need to generate 500 certificates for physical printing or a backup:

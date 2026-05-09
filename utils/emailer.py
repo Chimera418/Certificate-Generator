@@ -21,20 +21,26 @@ class EmailSender:
         self.use_starttls = str(os.environ.get("SMTP_STARTTLS", "true")).lower() == "true"
         self.use_ssl = str(os.environ.get("SMTP_SSL", "false")).lower() == "true"
 
-    def send_certificate(self, participant_email: str, participant_name: str, event_name: str, certificate_path: str) -> None:
+    def send_certificate(self, participant_email: str, participant_name: str, event_name: str, certificate_path: str,
+                         subject_template: str = None, plain_body_template: str = None, html_body_template: str = None) -> None:
         try:
             message = MIMEMultipart("alternative")
-            message["Subject"] = f"Your Certificate for {event_name}"
+            
+            # Format subject
+            subject = subject_template or "Your Certificate for {event_name}"
+            message["Subject"] = subject.format(participant_name=participant_name, event_name=event_name)
+            
             message["From"] = formataddr((self.from_name, self.from_address))
             message["To"] = participant_email
 
             # Add plain text version
-            plain_body = f"Hello {participant_name},\n\nAttached is your certificate for {event_name}. Congratulations!\n\nBest regards,\nThe Organizers"
+            plain_tmpl = plain_body_template or "Hello {participant_name},\n\nAttached is your certificate for {event_name}. Congratulations!\n\nBest regards,\nThe Organizers"
+            plain_body = plain_tmpl.format(participant_name=participant_name, event_name=event_name)
             text_part = MIMEText(plain_body, "plain", "utf-8")
             message.attach(text_part)
 
             # Add HTML version
-            html_body = f"""
+            html_tmpl = html_body_template or """
             <html>
                 <body>
                     <p>Hello <b>{participant_name}</b>,</p>
@@ -43,6 +49,7 @@ class EmailSender:
                 </body>
             </html>
             """
+            html_body = html_tmpl.format(participant_name=participant_name, event_name=event_name)
             html_part = MIMEText(html_body, "html", "utf-8")
             message.attach(html_part)
 

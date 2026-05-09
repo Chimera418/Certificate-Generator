@@ -8,8 +8,33 @@ from pathlib import Path
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app import load_event, load_csv_rows, generate_certificate_file, _cert_image_path, safe_download_name, GENERATED_DIR
+from app import load_event, load_event_csv_text, generate_certificate_file, _cert_image_path, safe_download_name, GENERATED_DIR, BASE_DIR
 from utils.emailer import EmailSender
+
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "system.log")
+
+def log_message(msg: str):
+    import datetime
+    print(msg)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+def load_csv_rows_raw(slug: str) -> list[dict]:
+    content = load_event_csv_text(slug)
+    if not content:
+        return []
+    import csv
+    reader = csv.DictReader(content.splitlines())
+    rows = []
+    for row in reader:
+        new_row = {k.strip().lower() if k else '': v.strip() if v else '' for k, v in row.items()}
+        rows.append(new_row)
+    return rows
 
 def split_csv(input_file: str, output_dir: str, chunk_size: int = 100):
     """Split a large CSV into smaller chunks."""
@@ -51,21 +76,27 @@ def _write_chunk(path: Path, headers: list, rows: list):
         writer.writerow(headers)
         writer.writerows(rows)
 
-def process_participant(slug: str, row: dict, event_config: dict, output_dir: Path, emailer: EmailSender = None) -> str:
+def process_participant(slug: str, row: dict, event_config: dict, output_dir: Path, emailer: EmailSender = None, 
+                        subject_template: str = None, plain_body_template: str = None, html_body_template: str = None) -> str:
     # Use name from 'name' column or 'player' column
     cert_name = row.get("name") or row.get("player") or "Participant"
     email = row.get("email")
     
-    # Generate certificate (this creates a randomly named PNG in GENERATED_DIR)
-    cert_id = generate_certificate_file(slug, cert_name, event_config)
-    source_img = Path(_cert_image_path(cert_id))
+    from app import _render_certificate_to_bytes, build_render_metadata
     
-    # Copy it to our organized output dir with a nice name
+    # Generate certificate (this creates a randomly named PNG blank template in GENERATED_DIR)
+    cert_id = generate_certificate_file(slug, cert_name, event_config)
+    
+    # Render the text onto the image
+    metadata = build_render_metadata(cert_id)
+    png_bytes, _ = _render_certificate_to_bytes(cert_id, metadata)
+    
+    # Save the fully rendered image to our organized output dir with a nice name
     friendly_name = safe_download_name(cert_name, slug)
     target_img = output_dir / friendly_name
     
-    import shutil
-    shutil.copy2(source_img, target_img)
+    with open(target_img, 'wb') as f:
+        f.write(png_bytes)
     
     status = f"Generated {friendly_name}"
     
@@ -75,7 +106,10 @@ def process_participant(slug: str, row: dict, event_config: dict, output_dir: Pa
                 participant_email=email,
                 participant_name=cert_name,
                 event_name=event_config.get("name", slug),
-                certificate_path=str(target_img)
+                certificate_path=str(target_img),
+                subject_template=subject_template,
+                plain_body_template=plain_body_template,
+                html_body_template=html_body_template
             )
             status += f" and emailed to {email}"
         except Exception as e:
@@ -83,15 +117,16 @@ def process_participant(slug: str, row: dict, event_config: dict, output_dir: Pa
             
     return status
 
-def bulk_generate(slug: str, send_emails: bool = False, max_workers: int = 4):
+def bulk_generate(slug: str, send_emails: bool = False, max_workers: int = 4, 
+                  subject_template: str = None, plain_body_template: str = None, html_body_template: str = None):
     event_config = load_event(slug)
     if not event_config:
-        print(f"Error: Event '{slug}' not found or inactive.")
+        log_message(f"Error: Event '{slug}' not found or inactive.")
         return
         
-    rows = load_csv_rows(slug)
+    rows = load_csv_rows_raw(slug)
     if not rows:
-        print(f"Error: No participants found in data.csv for event '{slug}'.")
+        log_message(f"Error: No participants found in data.csv for event '{slug}'.")
         return
         
     output_dir = Path(GENERATED_DIR) / slug / "exports"
@@ -99,24 +134,25 @@ def bulk_generate(slug: str, send_emails: bool = False, max_workers: int = 4):
     
     emailer = EmailSender() if send_emails else None
     if send_emails:
-        print(f"Email delivery enabled. SMTP Host: {emailer.smtp_host}")
+        log_message(f"Email delivery enabled. SMTP Host: {emailer.smtp_host}")
     
-    print(f"Starting bulk generation for {len(rows)} participants in event '{slug}'...")
+    log_message(f"Starting bulk generation for {len(rows)} participants in event '{slug}'...")
     
     success_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_participant, slug, row, event_config, output_dir, emailer): row for row in rows}
+        futures = {executor.submit(process_participant, slug, row, event_config, output_dir, emailer, 
+                                   subject_template, plain_body_template, html_body_template): row for row in rows}
         
         for future in concurrent.futures.as_completed(futures):
             try:
                 result = future.result()
-                print(f"[SUCCESS] {result}")
+                log_message(f"[SUCCESS] {result}")
                 success_count += 1
             except Exception as exc:
-                print(f"[ERROR] Participant processing generated an exception: {exc}")
+                log_message(f"[ERROR] Participant processing generated an exception: {exc}")
                 
-    print(f"\nCompleted! Successfully processed {success_count}/{len(rows)} participants.")
-    print(f"Certificates exported to: {output_dir}")
+    log_message(f"Completed! Successfully processed {success_count}/{len(rows)} participants.")
+    log_message(f"Certificates exported to: {output_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Certificate Generator Management CLI")

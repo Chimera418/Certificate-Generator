@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>System Logs – Admin</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <div class="admin-layout">
+      <header class="admin-header">
+        <span class="admin-header-title">Certificate Portal &mdash; Admin Logs</span>
+        <div class="admin-header-actions">
+          <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">Back to Dashboard</a>
+          <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+            <button class="admin-nav-btn" type="submit">Log Out</button>
+          </form>
+        </div>
+      </header>
+
+      <main class="admin-main">
+        <div class="admin-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+            <div>
+              <h2>System Logs</h2>
+              <p class="admin-subtitle">View background job and email delivery logs</p>
+            </div>
+            <form method="post" action="{{ url_for('admin_clear_logs') }}" onsubmit="return confirm('Are you sure you want to clear all logs?');">
+              <button class="admin-action-btn danger" type="submit">Clear Logs</button>
+            </form>
+          </div>
+          
+          <div style="background: rgba(13, 24, 42, 0.96); padding: 1.5rem; border-radius: 12px; height: 65vh; overflow-y: auto; border: 1px solid var(--border);">
+            {% if logs %}
+              <pre style="margin: 0; font-family: monospace; font-size: 0.85rem; color: #a1b0c0; white-space: pre-wrap; word-wrap: break-word;">{{ logs }}</pre>
+            {% else %}
+              <div class="empty-state">
+                <p>No system logs found.</p>
+                <p class="admin-subtitle">Logs will appear here once background tasks are executed.</p>
+              </div>
+            {% endif %}
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script>
+      // Auto-scroll to bottom of logs on load
+      document.addEventListener("DOMContentLoaded", function() {
+        const logContainer = document.querySelector(".admin-card > div:nth-child(2)");
+        if (logContainer) {
+          logContainer.scrollTop = logContainer.scrollHeight;
+        }
+      });
+    </script>
+  </body>
+</html>

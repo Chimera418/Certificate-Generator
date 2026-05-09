@@ -11,6 +11,7 @@
       <header class="admin-header">
         <span class="admin-header-title">Certificate Portal &mdash; Admin</span>
         <div class="admin-header-actions">
+          <a href="{{ url_for('admin_logs') }}" class="admin-nav-link">View Logs</a>
           <a href="{{ url_for('home') }}" class="admin-nav-link">View Site</a>
           <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
             <button class="admin-nav-btn" type="submit">Log Out</button>
@@ -58,6 +59,7 @@
                       {{ 'Deactivate' if event.active else 'Activate' }}
                     </button>
                   </form>
+                  <a href="{{ url_for('admin_send_emails', slug=event.slug) }}" class="admin-action-link">Send Emails</a>
                   <button class="admin-action-btn danger" type="button"
                     onclick="toggleDeleteRow('{{ event.slug }}')">Delete</button>
                 </td>
