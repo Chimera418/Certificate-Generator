@@ -20,7 +20,8 @@ Participants open an event page, validate their details against a CSV list, ente
   - no validation
 - Server-side certificate rendering with Pillow
 - Font support with a shared font asset route
-- Optional KV-backed persistence with local file fallback
+- Supabase Storage for templates and KV-backed persistence, with local file fallback
+- Stateless certificate links: nothing is written to disk per request
 
 ## Tech Stack
 
@@ -32,11 +33,13 @@ Participants open an event page, validate their details against a CSV list, ente
 ## Project Structure
 
 - app.py: Main Flask app, routing, validation, rendering
+- manage.py: CLI for bulk generation, bulk email, and CSV splitting
 - templates/: HTML templates for public pages
 - static/style.css: Shared styling
 - fonts/: TTF files used for text rendering
-- events/: Event folders (template, CSV, config)
-- generated_certificates/: Runtime artifacts (generated PNG + metadata)
+- tests/: Runnable checks for the certificate flow and template uploads
+- events/: Local event folders (template, CSV, config) - the fallback store
+- generated_certificates/: Bulk export output from manage.py
 
 ## Requirements
 
@@ -70,15 +73,99 @@ Then open:
 
 ## Environment Variables
 
-- SECRET_KEY: Flask session secret (recommended in non-local environments)
-- KV_REST_API_URL: Optional KV REST base URL
-- KV_REST_API_TOKEN: Optional KV auth token
-- KV_EVENT_STATE_KEY: Optional key for event state map
-- KV_EVENT_INDEX_KEY: Optional key for event index list
-- KV_EVENT_CONFIG_PREFIX: Optional prefix for event config keys
-- KV_EVENT_CSV_PREFIX: Optional prefix for event CSV keys
+Required in any deployed environment:
 
-If KV variables are not set, the app uses local files under the runtime writable directory.
+- ADMIN_PASSWORD: Password for the organizer interface. Without it, admin login is disabled.
+- SECRET_KEY: Signs admin sessions **and certificate links**. It must be the same
+  value across every worker and across restarts. If it is unset the app generates a
+  random key per process, logs a warning, and outstanding certificate links break on
+  every restart.
+
+Storage (optional, but required for a real deployment):
+
+- SUPABASE_URL: Supabase project URL
+- SUPABASE_SERVICE_KEY: Supabase service_role key
+- SUPABASE_BUCKET: Bucket name for templates (default: certificate-templates)
+- KV_REST_API_URL: KV REST base URL
+- KV_REST_API_TOKEN: KV auth token
+- KV_EVENT_STATE_KEY / KV_EVENT_INDEX_KEY / KV_EVENT_CONFIG_PREFIX / KV_EVENT_CSV_PREFIX:
+  Optional key names, all with sensible defaults
+
+Tuning:
+
+- SESSION_COOKIE_SECURE: Set to "true" when serving over HTTPS
+- TEMPLATE_CACHE_MAX / RENDER_CACHE_MAX: In-memory cache sizes per worker (default 6 each)
+- PREVIEW_MAX_WIDTH: Width of the on-screen preview image in px (default 1200)
+- PREVIEW_JPEG_QUALITY: JPEG quality for the preview (default 90)
+- DOWNLOAD_PNG_COMPRESS_LEVEL: PNG compression for downloads, 1-9 (default 3)
+
+If the storage variables are not set, the app falls back to local files under the
+runtime writable directory. That is fine locally and wrong on any host with an
+ephemeral filesystem.
+
+## Storage Model
+
+Nothing that matters lives on the web server's disk:
+
+| Data | Primary store | Fallback |
+| --- | --- | --- |
+| Certificate templates | Supabase Storage | Local `events/<slug>/template.*` |
+| Event configs | KV | Local `events/<slug>/config.json` |
+| Participant CSVs | KV | Local `events/<slug>/data.csv` |
+| Generated certificates | Not stored - rendered on demand | n/a |
+
+A certificate link is a signed token containing the event slug and the printed
+name, not a pointer to a saved file. Any worker can serve any link, links survive
+redeploys, and no cleanup job is needed. Tokens are signed with SECRET_KEY, so
+they cannot be forged or enumerated.
+
+Uploading a template records a `template_version` on the event config. Every image
+cache key includes that version, which is what makes a replaced template take
+effect immediately instead of being served stale from memory.
+
+### Supabase setup
+
+1. Create a Supabase project.
+2. Copy the project URL and the `service_role` key from Project Settings -> API.
+3. Set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`.
+
+The private bucket is created automatically on the first template upload. The
+service key is server-side only and must never reach the browser.
+
+Free Supabase projects pause after roughly a week of inactivity. Point the
+keep-alive cron at `/healthz` rather than `/`: that endpoint deliberately makes a
+Supabase request, so it keeps both the web service and the storage project awake.
+
+## Tests
+
+No test framework is required; each file runs on its own against a temporary
+events directory with no network access.
+
+```bash
+python tests/test_certificate_flow.py
+python tests/test_template_upload.py
+python tests/test_supabase_storage.py
+python tests/test_csrf.py
+python tests/test_email_templates.py
+```
+
+## CSRF Protection
+
+Every request using an unsafe method (POST, PUT, PATCH, DELETE) must carry a token
+tied to the caller's session, submitted either as a `csrf_token` form field or an
+`X-CSRF-Token` header. Enforcement lives in a `before_request` hook and is
+**fail-closed by default**: a route added later is protected without anyone having
+to remember to protect it. Use the `@csrf_exempt` decorator to opt a route out;
+nothing does today.
+
+Templates render the field with `{{ csrf_token() }}`. The admin autosave posts
+`new FormData(form)`, so it picks the field up with no extra JavaScript.
+
+Logging in clears the session and mints a fresh token, so a token observed before
+login cannot be replayed against admin routes. Rejected requests get the
+`csrf_error.html` page, or a JSON error for `X-Requested-With: XMLHttpRequest`
+callers. Session cookies are also `SameSite=Lax`, which blocks the cross-site POST
+independently in modern browsers.
 
 ## Public Flow
 
@@ -86,8 +173,8 @@ If KV variables are not set, the app uses local files under the runtime writable
 2. User selects an active event
 3. User submits required validation input(s)
 4. User provides name to print
-5. App generates a certificate image and redirects to preview
-6. User downloads the certificate PNG
+5. App validates and redirects to a signed preview link
+6. The image is rendered on demand and the user downloads the PNG
 
 ## Organizer Interface
 
@@ -130,6 +217,14 @@ Notes:
 - slug must be lowercase letters, numbers, and hyphens only
 - text_x and text_y are center coordinates for certificate text
 - font_color is RGB list [r, g, b]
+
+## Email Templates
+
+The Send Emails form accepts `{participant_name}` and `{event_name}` in the subject
+and both bodies. Substitution is a plain placeholder replacement, not `str.format()`:
+unknown placeholders and stray braces (a CSS rule in an HTML body, say) are left
+alone rather than raising, and `{event_name.__class__...}` style attribute traversal
+is not evaluated. Values are HTML-escaped in the HTML part only.
 
 ## Validation Types and CSV Rules
 
@@ -195,21 +290,45 @@ design,D008,Sara Arjun
 - GET / : List active events
 - GET /events/<slug> : Event certificate form
 - POST /events/<slug>/download : Validate + generate certificate
-- GET /preview/<cert_id> : Preview page
-- GET /preview-image/<cert_id> : Rendered certificate image
-- GET /download-file/<cert_id> : Download final PNG
+- GET /preview/<token> : Preview page
+- GET /preview-image/<token> : Rendered certificate image
+- GET /download-file/<token> : Download final PNG
 - GET /assets/fonts/<font_key>.ttf : Font asset
+- GET /healthz : Liveness check; also pings storage to keep it awake
 
 ## Performance Notes
 
-The app includes in-memory caches for:
+Certificate rendering happens on the GET that serves the image, not on the form
+POST, so submitting the form stays fast even under event-day traffic spikes.
 
-- Event configs
-- Template images
-- Loaded fonts
-- Rendered certificate previews
+Encoding, not drawing, is what costs. On a typical A4 300 DPI template (3508x2480,
+8.7 MP), drawing the participant's name takes about 4 ms while encoding the image
+takes hundreds. Two consequences shape the render path:
 
-This reduces repeated disk and KV calls for frequent preview/download traffic.
+- **The preview is downscaled and sent as JPEG.** Nobody views 3508 px in an `<img>`
+  tag, and the full-size PNG was ~2.5 MB per view.
+- **Downloads keep full resolution** but drop the pointless alpha channel and use a
+  lighter PNG compression level. The file ends up slightly *smaller* than before.
+
+Measured on the bundled A4 template:
+
+| Path | Before | After |
+| --- | --- | --- |
+| Preview image | 274 ms, 2.5 MB | **41 ms, 154 KB** |
+| Download | 389 ms, 2.76 MB | **213 ms, 2.65 MB** |
+
+Participant CSVs are cached for 30 seconds as well. One page view used to re-fetch
+the CSV once per dropdown column plus again during validation; a custom-validation
+event with three dropdowns went from 4 fetches per submission to 1.
+
+Templates are held as RGB unless the file genuinely has alpha, which is 25% less
+memory per cached image. Bounded LRU caches cover event configs, decoded templates,
+loaded fonts, and rendered output; raise TEMPLATE_CACHE_MAX and RENDER_CACHE_MAX if
+the instance has memory to spare.
+
+Rendering with OpenCV was evaluated and rejected: `cv2.putText` supports only
+Hershey stroke fonts, so it cannot draw Montserrat or any other TrueType face, and
+it would only have touched the ~1% of render time spent drawing text.
 
 ## Troubleshooting
 
@@ -301,8 +420,12 @@ The repository includes process and platform config files for WSGI deployment.
 Recommended production run command:
 
 ```bash
-gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 120
+gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --worker-class gthread --timeout 120
 ```
+
+Multiple workers are safe now that templates live in Supabase and certificates are
+rendered on demand, but only if SECRET_KEY is set to a fixed value: every worker
+must sign certificate links with the same key.
 
 ## License
 

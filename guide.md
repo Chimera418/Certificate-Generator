@@ -14,13 +14,30 @@ certificate_generator/
 ├── manage.py               # The Backend CLI Tool
 ├── profiles.yaml           # Reusable Layout Profiles
 ├── .env                    # Environment & SMTP Variables
-├── events/                 # Your events live here!
+├── tests/                  # Runnable checks (no test framework needed)
+├── events/                 # Local event files (fallback when storage is unset)
 │   └── demo/
 │       ├── config.json     # Event configuration
 │       ├── data.csv        # Participant records
 │       └── template.png    # The certificate design
-└── generated_certificates/ # Where bulk outputs are saved
+└── generated_certificates/ # Where bulk CLI exports are saved
 ```
+
+### Where things are actually stored
+
+In a real deployment the web server's disk is disposable:
+
+- **Templates** go to Supabase Storage. Set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
+  and the bucket is created for you on the first upload.
+- **Configs and participant CSVs** go to the KV store.
+- **Certificates are never stored.** A certificate link is a signed token holding the
+  event slug and the printed name; the image is rendered fresh on each request. That
+  means links keep working after a redeploy, and nothing needs cleaning up.
+- The `events/` folder is the fallback used when no storage is configured, which is
+  the normal setup for local development.
+
+Because links are signed with `SECRET_KEY`, that value must be set and must stay the
+same. If it changes, every previously issued certificate link stops resolving.
 
 ### Environment Variables (`.env`)
 Before using the tool in production, configure your `.env` file. You need this to protect your admin dashboard and send emails:
@@ -28,6 +45,11 @@ Before using the tool in production, configure your `.env` file. You need this t
 ```env
 ADMIN_PASSWORD=your_secure_password
 SECRET_KEY=your_random_secret_string
+
+# Supabase Storage (certificate templates)
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=your_service_role_key
+SUPABASE_BUCKET=certificate-templates
 
 # SMTP Email Configuration (Example for Outlook)
 SMTP_HOST=smtp-mail.outlook.com
