@@ -3,97 +3,45 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Send Emails – {{ event.name }} – Admin</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Send emails &mdash; {{ event.name }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
-    <style>
-      body { overflow: hidden; }
-      .coord-editor-layout {
-        display: flex; height: 100vh;
-        background: radial-gradient(circle at top, rgba(97, 168, 255, 0.18), transparent 32%),
-                    linear-gradient(180deg, var(--bg-accent) 0%, var(--bg) 100%);
-      }
-      .coord-editor-canvas {
-        flex: 1; background: rgba(7, 17, 31, 0.45);
-        display: flex; align-items: center; justify-content: center;
-        padding: 1rem; overflow: auto; position: relative;
-      }
-      #certEditorCanvas {
-        max-width: 100%; max-height: 100%; cursor: crosshair;
-        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.38); border-radius: 8px;
-      }
-      .coord-editor-panel {
-        width: 380px; background: rgba(13, 24, 42, 0.96);
-        border-left: 1px solid var(--border); padding: 1.5rem;
-        overflow-y: auto; display: flex; flex-direction: column; backdrop-filter: blur(16px);
-      }
-      .coord-editor-panel h3 { margin: 1rem 0 1rem; font-size: 1.1rem; }
-      .coord-editor-panel h3:first-child { margin-top: 0; }
-      .coord-editor-control { margin-bottom: 1.25rem; }
-      .coord-editor-control label {
-        display: block; margin-bottom: 0.4rem; font-weight: 600; font-size: 0.9rem; color: var(--text);
-      }
-      .coord-editor-control input, .coord-editor-control textarea, .coord-editor-control select {
-        width: 100%; border: 1px solid var(--border); border-radius: 8px;
-        padding: 0.6rem; font-size: 0.95rem; background: var(--surface); color: var(--text);
-      }
-      .coord-editor-control input[type="color"] {
-        appearance: none; -webkit-appearance: none; min-height: 44px; padding: 0.2rem; cursor: pointer;
-      }
-      .coord-editor-control input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
-      .coord-editor-control input[type="color"]::-webkit-color-swatch { border: none; border-radius: 6px; }
-      .coord-editor-control input[type="color"]::-moz-color-swatch { border: none; border-radius: 6px; }
-      .coord-editor-control input:focus, .coord-editor-control textarea:focus, .coord-editor-control select:focus {
-        outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
-      }
-      .coord-editor-actions { margin-top: auto; display: flex; flex-direction: column; gap: 0.75rem; }
-      .coord-editor-btn {
-        border: none; border-radius: 8px; padding: 0.75rem 1rem;
-        font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: all 0.15s;
-      }
-      .coord-editor-btn.primary { background: var(--accent); color: #fff; }
-      .coord-editor-btn.primary:hover { background: var(--accent-hover); }
-      .coord-editor-btn.secondary { background: #31445f; color: var(--text); text-align: center; text-decoration: none; }
-      .coord-editor-btn.secondary:hover { background: #3c5474; }
-      
-      .coord-row { display: flex; gap: 0.5rem; }
-      .coord-row .coord-editor-control { flex: 1; margin-bottom: 0.5rem; }
-    </style>
   </head>
   <body>
     <div class="coord-editor-layout">
       <div class="coord-editor-canvas">
         <canvas id="certEditorCanvas"></canvas>
       </div>
+
       <div class="coord-editor-panel">
-        
-        <form id="editorForm" method="post" action="{{ url_for('admin_send_emails', slug=event.slug) }}" onsubmit="return confirm('Start background job to generate and send emails with these settings?');">
+        <form id="editorForm" method="post"
+              action="{{ url_for('admin_send_emails', slug=event.slug) }}"
+              onsubmit="return confirm('Generate and email certificates to everyone in the participant list?');">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-          
-          <h3>Email Configuration</h3>
-          
+
+          <h3>Message</h3>
+
           <div class="coord-editor-control">
-            <label for="sample_text">Preview Name</label>
-            <input id="sample_text" type="text" value="Test Participant Name" />
+            <label for="subject_template">Subject</label>
+            <input type="text" id="subject_template" name="subject_template"
+                   value="Your Certificate for {event_name}" required />
+            <p class="field-hint">
+              Placeholders: <code>{participant_name}</code>, <code>{event_name}</code>
+            </p>
           </div>
 
           <div class="coord-editor-control">
-            <label for="subject_template">Email Subject</label>
-            <input type="text" id="subject_template" name="subject_template" value="Your Certificate for {event_name}" required />
-            <small style="color:var(--muted); font-size:0.8rem;">Variables: {participant_name}, {event_name}</small>
-          </div>
-          
-          <div class="coord-editor-control">
-            <label for="plain_body_template">Email Body (Plain Text)</label>
-            <textarea id="plain_body_template" name="plain_body_template" rows="5" required>Hello {participant_name},
+            <label for="plain_body_template">Plain text body</label>
+            <textarea id="plain_body_template" name="plain_body_template" rows="6" required>Hello {participant_name},
 
 Attached is your certificate for {event_name}. Congratulations!
 
 Best regards,
 The Organizers</textarea>
           </div>
-          
+
           <div class="coord-editor-control">
-            <label for="html_body_template">Email Body (HTML)</label>
+            <label for="html_body_template">HTML body</label>
             <textarea id="html_body_template" name="html_body_template" rows="8" required>&lt;html&gt;
   &lt;body&gt;
     &lt;p&gt;Hello &lt;b&gt;{participant_name}&lt;/b&gt;,&lt;/p&gt;
@@ -102,45 +50,64 @@ The Organizers</textarea>
   &lt;/body&gt;
 &lt;/html&gt;</textarea>
           </div>
-          
-          <h3>Certificate Settings</h3>
-          
+
+          <h3>Certificate</h3>
+
+          <div class="coord-editor-control">
+            <label for="sample_text">Preview name</label>
+            <input id="sample_text" type="text" value="Test Participant" autocomplete="off" />
+          </div>
+
           <div class="coord-row">
             <div class="coord-editor-control">
-              <label for="text_x">X Position</label>
-              <input id="text_x" name="text_x" type="number" min="0" value="{{ event.text_x if event else 1789 }}" />
+              <label for="text_x">X</label>
+              <input id="text_x" name="text_x" class="coord-input" type="number" min="0"
+                     value="{{ event.text_x if event else 1789 }}" />
             </div>
             <div class="coord-editor-control">
-              <label for="text_y">Y Position</label>
-              <input id="text_y" name="text_y" type="number" min="0" value="{{ event.text_y if event else 1440 }}" />
+              <label for="text_y">Y</label>
+              <input id="text_y" name="text_y" class="coord-input" type="number" min="0"
+                     value="{{ event.text_y if event else 1440 }}" />
             </div>
           </div>
-          
+
           <div class="coord-row">
             <div class="coord-editor-control">
-              <label for="font_size">Font Size</label>
-              <input id="font_size" name="font_size" type="number" min="8" value="{{ event.font_size if event else 100 }}" />
+              <label for="font_size">Size</label>
+              <input id="font_size" name="font_size" class="coord-input" type="number" min="8"
+                     value="{{ event.font_size if event else 100 }}" />
             </div>
             <div class="coord-editor-control">
-              <label for="font_color">Color</label>
+              <label for="font_color">Colour</label>
               {% set fc = event.font_color if event and event.font_color else [50, 34, 24] %}
-              <input id="font_color" name="font_color" type="color" value="#{{ '%02x%02x%02x' % (fc[0], fc[1], fc[2]) }}" />
+              <input id="font_color" name="font_color" type="color"
+                     value="#{{ '%02x%02x%02x' % (fc[0], fc[1], fc[2]) }}" />
             </div>
           </div>
-          
-          <div class="coord-editor-control" style="margin-bottom: 2rem;">
-            <label for="font_key">Font Family</label>
+
+          <div class="coord-editor-control">
+            <label for="font_key">Typeface</label>
             <select id="font_key" name="font_key">
               {% set selected_font_key = event.font_key if event and event.font_key else default_font_key %}
               {% for option in font_options %}
-              <option value="{{ option.key }}" data-family="{{ option.css_family }}" data-weight="{{ option.css_weight }}" data-url="{{ url_for('font_asset', font_key=option.key) }}" {{ 'selected' if option.key == selected_font_key else '' }}>{{ option.label }}</option>
+              <option value="{{ option.key }}"
+                      data-family="{{ option.css_family }}"
+                      data-weight="{{ option.css_weight }}"
+                      data-url="{{ url_for('font_asset', font_key=option.key) }}"
+                      {{ 'selected' if option.key == selected_font_key else '' }}>{{ option.label }}</option>
               {% endfor %}
             </select>
           </div>
-          
+
+          <p class="coord-info">
+            Sending runs in the background. Progress appears in
+            <strong>Logs</strong>, and it cannot be stopped once started.
+          </p>
+
           <div class="coord-editor-actions">
-            <button type="submit" class="coord-editor-btn primary">🚀 Send Emails</button>
-            <a href="{{ url_for('admin_dashboard') }}" class="coord-editor-btn secondary">Cancel</a>
+            <button type="submit" class="coord-editor-btn">Send emails</button>
+            <a href="{{ url_for('admin_dashboard') }}"
+               class="button-link secondary coord-editor-btn">Cancel</a>
           </div>
         </form>
       </div>
@@ -169,22 +136,26 @@ The Organizers</textarea>
       const loadedPreviewFonts = new Set();
 
       function selectedPreviewFont() {
-        const selectedOption = fontKeyInput && fontKeyInput.selectedOptions ? fontKeyInput.selectedOptions[0] : null;
+        const selected = fontKeyInput && fontKeyInput.selectedOptions
+          ? fontKeyInput.selectedOptions[0]
+          : null;
         return {
-          family: (selectedOption && selectedOption.dataset.family) || 'Montserrat Bold',
-          weight: (selectedOption && selectedOption.dataset.weight) || '700',
-          url: (selectedOption && selectedOption.dataset.url) || ''
+          family: (selected && selected.dataset.family) || 'Montserrat Bold',
+          weight: (selected && selected.dataset.weight) || '700',
+          url: (selected && selected.dataset.url) || ''
         };
       }
 
       function ensurePreviewFontLoaded() {
         const font = selectedPreviewFont();
         if (!document.fonts) return Promise.resolve();
-        if (loadedPreviewFonts.has(font.family)) return document.fonts.load(`${font.weight} 32px "${font.family}"`).catch(() => undefined);
+        if (loadedPreviewFonts.has(font.family)) {
+          return document.fonts.load(`${font.weight} 32px "${font.family}"`).catch(() => undefined);
+        }
         if (window.FontFace && font.url) {
           const face = new FontFace(font.family, `url(${font.url})`, { weight: font.weight });
-          return face.load().then((loadedFace) => {
-            document.fonts.add(loadedFace);
+          return face.load().then((loaded) => {
+            document.fonts.add(loaded);
             loadedPreviewFonts.add(font.family);
             return document.fonts.load(`${font.weight} 32px "${font.family}"`);
           }).catch(() => undefined);
@@ -194,21 +165,24 @@ The Organizers</textarea>
 
       function resizeCanvas() {
         const container = canvas.parentElement;
-        maxCanvasWidth = container.clientWidth - 20;
-        maxCanvasHeight = container.clientHeight - 20;
+        maxCanvasWidth = container.clientWidth - 32;
+        maxCanvasHeight = container.clientHeight - 32;
         drawPreview();
       }
 
       function loadCertImage() {
         const img = new Image();
-        img.onload = () => { certImage = img; ensurePreviewFontLoaded().finally(resizeCanvas); };
+        img.onload = () => {
+          certImage = img;
+          ensurePreviewFontLoaded().finally(resizeCanvas);
+        };
         img.onerror = () => {
-          certImage = null; ctx.clearRect(0, 0, canvas.width, canvas.height);
-          const fallbackFont = selectedPreviewFont();
-          ctx.fillStyle = '#999';
-          ctx.font = `${fallbackFont.weight} 20px "${fallbackFont.family}", Arial`;
+          certImage = null;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#85858f';
+          ctx.font = '600 16px system-ui, Arial';
           ctx.textAlign = 'center';
-          ctx.fillText('Preview not available', canvas.width / 2, canvas.height / 2);
+          ctx.fillText('Preview unavailable', canvas.width / 2, canvas.height / 2);
         };
         img.src = `${templatePreviewUrl}?t=${Date.now()}`;
       }
@@ -219,7 +193,6 @@ The Organizers</textarea>
         const imgAspect = certImage.width / certImage.height;
         let drawWidth = maxCanvasWidth;
         let drawHeight = drawWidth / imgAspect;
-
         if (drawHeight > maxCanvasHeight) {
           drawHeight = maxCanvasHeight;
           drawWidth = drawHeight * imgAspect;
@@ -227,28 +200,27 @@ The Organizers</textarea>
 
         scaleX = drawWidth / certImage.width;
         scaleY = drawHeight / certImage.height;
-
         canvas.width = drawWidth;
         canvas.height = drawHeight;
 
         ctx.drawImage(certImage, 0, 0, drawWidth, drawHeight);
 
-        const x = parseInt(textXInput.value) * scaleX;
-        const y = parseInt(textYInput.value) * scaleY;
-        const size = parseInt(fontSizeInput.value) * scaleX / 2;
+        const x = parseInt(textXInput.value, 10) * scaleX;
+        const y = parseInt(textYInput.value, 10) * scaleY;
+        const size = (parseInt(fontSizeInput.value, 10) * scaleX) / 2;
         const color = fontColorInput.value || '#321812';
         const displayText = sampleTextInput.value.trim() || 'Sample Text';
         const font = selectedPreviewFont();
 
         if (isDragging) {
-          ctx.fillStyle = 'rgba(45, 108, 223, 0.1)';
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
           ctx.beginPath();
           ctx.arc(x, y, size * 1.8, 0, Math.PI * 2);
           ctx.fill();
         }
 
         ctx.strokeStyle = color;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(x, y, size, 0, Math.PI * 2);
         ctx.stroke();
@@ -261,60 +233,56 @@ The Organizers</textarea>
         ctx.stroke();
 
         ctx.fillStyle = color;
-        ctx.font = `${font.weight} ${Math.max(12, parseInt(fontSizeInput.value) * scaleX)}px "${font.family}", Arial`;
+        ctx.font = `${font.weight} ${Math.max(10, parseInt(fontSizeInput.value, 10) * scaleX)}px "${font.family}", Arial`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(displayText, x, y);
       }
 
-      canvas.addEventListener('mousedown', (e) => {
+      canvas.addEventListener('pointerdown', (event) => {
         if (!certImage) return;
         const rect = canvas.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
+        const pointerX = event.clientX - rect.left;
+        const pointerY = event.clientY - rect.top;
+        const textX = parseInt(textXInput.value, 10) * scaleX;
+        const textY = parseInt(textYInput.value, 10) * scaleY;
+        const size = (parseInt(fontSizeInput.value, 10) * scaleX) / 2;
+        const distX = pointerX - textX;
+        const distY = pointerY - textY;
 
-        const textX = parseInt(textXInput.value) * scaleX;
-        const textY = parseInt(textYInput.value) * scaleY;
-        const size = parseInt(fontSizeInput.value) * scaleX / 2;
-
-        const distX = mouseX - textX;
-        const distY = mouseY - textY;
-        const distance = Math.sqrt(distX * distX + distY * distY);
-
-        if (distance < size * 2) {
+        if (Math.sqrt(distX * distX + distY * distY) < Math.max(size * 2, 28)) {
           isDragging = true;
           dragOffsetX = distX;
           dragOffsetY = distY;
+          canvas.setPointerCapture(event.pointerId);
           canvas.style.cursor = 'grabbing';
+          event.preventDefault();
         }
       });
 
-      canvas.addEventListener('mousemove', (e) => {
+      canvas.addEventListener('pointermove', (event) => {
         if (!isDragging || !certImage) return;
-
         const rect = canvas.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-
-        const newX = Math.round((mouseX - dragOffsetX) / scaleX);
-        const newY = Math.round((mouseY - dragOffsetY) / scaleY);
-
-        textXInput.value = Math.max(0, newX);
-        textYInput.value = Math.max(0, newY);
+        textXInput.value = Math.max(0, Math.round((event.clientX - rect.left - dragOffsetX) / scaleX));
+        textYInput.value = Math.max(0, Math.round((event.clientY - rect.top - dragOffsetY) / scaleY));
         drawPreview();
+        event.preventDefault();
       });
 
-      canvas.addEventListener('mouseup', () => {
+      function endDrag(event) {
+        if (!isDragging) return;
         isDragging = false;
         canvas.style.cursor = 'crosshair';
-      });
+        if (event && event.pointerId !== undefined && canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+        drawPreview();
+      }
 
-      canvas.addEventListener('mouseleave', () => {
-        isDragging = false;
-        canvas.style.cursor = 'crosshair';
-      });
+      canvas.addEventListener('pointerup', endDrag);
+      canvas.addEventListener('pointercancel', endDrag);
 
-      [textXInput, textYInput, fontSizeInput, fontColorInput, sampleTextInput].forEach(input => {
+      [textXInput, textYInput, fontSizeInput, fontColorInput, sampleTextInput].forEach((input) => {
         input.addEventListener('input', drawPreview);
       });
       if (fontKeyInput) {

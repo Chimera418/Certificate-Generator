@@ -53,6 +53,21 @@ class Results:
         return 0
 
 
+def make_xlsx_bytes(rows=None) -> bytes:
+    """A minimal .xlsx workbook, for exercising the spreadsheet upload path."""
+    from openpyxl import Workbook
+
+    if rows is None:
+        rows = [["name", "email"], [TEST_NAME, TEST_EMAIL], ["Grace Hopper", "grace@example.com"]]
+    workbook = Workbook()
+    sheet = workbook.active
+    for row in rows:
+        sheet.append(row)
+    buf = io.BytesIO()
+    workbook.save(buf)
+    return buf.getvalue()
+
+
 def make_template_bytes(size=TEMPLATE_SIZE, color=(240, 235, 220), mode="RGB") -> bytes:
     """A synthetic certificate template. mode="RGBA" produces one with real alpha."""
     buf = io.BytesIO()

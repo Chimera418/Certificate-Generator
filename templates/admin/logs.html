@@ -3,57 +3,53 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>System Logs – Admin</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Logs &mdash; Admin</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
     <div class="admin-layout">
       <header class="admin-header">
-        <span class="admin-header-title">Certificate Portal &mdash; Admin Logs</span>
+        <span class="admin-header-title">Certificate Portal</span>
         <div class="admin-header-actions">
-          <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">Back to Dashboard</a>
-          <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+          <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">Events</a>
+          <form action="{{ url_for('admin_logout') }}" method="post">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <button class="admin-nav-btn" type="submit">Log Out</button>
+            <button class="admin-nav-btn" type="submit">Sign out</button>
           </form>
         </div>
       </header>
 
       <main class="admin-main">
+        <div class="admin-section-header">
+          <div>
+            <h2>System logs</h2>
+            <p class="admin-subtitle">Background jobs and email delivery</p>
+          </div>
+          <form method="post" action="{{ url_for('admin_clear_logs') }}"
+                onsubmit="return confirm('Clear all logs?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <button class="admin-action-btn danger" type="submit">Clear</button>
+          </form>
+        </div>
+
         <div class="admin-card">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
-            <div>
-              <h2>System Logs</h2>
-              <p class="admin-subtitle">View background job and email delivery logs</p>
-            </div>
-            <form method="post" action="{{ url_for('admin_clear_logs') }}" onsubmit="return confirm('Are you sure you want to clear all logs?');">
-              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-              <button class="admin-action-btn danger" type="submit">Clear Logs</button>
-            </form>
+          {% if logs %}
+          <div class="log-viewport" id="logViewport"><pre class="log-output">{{ logs }}</pre></div>
+          {% else %}
+          <div class="empty-state">
+            <p>No logs yet.</p>
+            <p class="admin-subtitle">They appear once a background job runs.</p>
           </div>
-          
-          <div style="background: rgba(13, 24, 42, 0.96); padding: 1.5rem; border-radius: 12px; height: 65vh; overflow-y: auto; border: 1px solid var(--border);">
-            {% if logs %}
-              <pre style="margin: 0; font-family: monospace; font-size: 0.85rem; color: #a1b0c0; white-space: pre-wrap; word-wrap: break-word;">{{ logs }}</pre>
-            {% else %}
-              <div class="empty-state">
-                <p>No system logs found.</p>
-                <p class="admin-subtitle">Logs will appear here once background tasks are executed.</p>
-              </div>
-            {% endif %}
-          </div>
+          {% endif %}
         </div>
       </main>
     </div>
 
     <script>
-      // Auto-scroll to bottom of logs on load
-      document.addEventListener("DOMContentLoaded", function() {
-        const logContainer = document.querySelector(".admin-card > div:nth-child(2)");
-        if (logContainer) {
-          logContainer.scrollTop = logContainer.scrollHeight;
-        }
-      });
+      // Newest lines are at the bottom, so open scrolled to the end.
+      const viewport = document.getElementById('logViewport');
+      if (viewport) viewport.scrollTop = viewport.scrollHeight;
     </script>
   </body>
 </html>

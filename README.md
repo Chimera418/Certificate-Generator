@@ -85,7 +85,7 @@ Storage (optional, but required for a real deployment):
 
 - SUPABASE_URL: Supabase project URL
 - SUPABASE_SERVICE_KEY: Supabase service_role key
-- SUPABASE_BUCKET: Bucket name for templates (default: certificate-templates)
+- SUPABASE_BUCKET: Club bucket holding every event folder (default: csi-aseb)
 - KV_REST_API_URL: KV REST base URL
 - KV_REST_API_TOKEN: KV auth token
 - KV_EVENT_STATE_KEY / KV_EVENT_INDEX_KEY / KV_EVENT_CONFIG_PREFIX / KV_EVENT_CSV_PREFIX:
@@ -110,9 +110,34 @@ Nothing that matters lives on the web server's disk:
 | Data | Primary store | Fallback |
 | --- | --- | --- |
 | Certificate templates | Supabase Storage | Local `events/<slug>/template.*` |
+| Participant lists | Supabase Storage | KV (legacy), then local `events/<slug>/data.csv` |
 | Event configs | KV | Local `events/<slug>/config.json` |
-| Participant CSVs | KV | Local `events/<slug>/data.csv` |
 | Generated certificates | Not stored - rendered on demand | n/a |
+
+### Bucket layout
+
+One bucket for the club, one folder per event:
+
+```text
+csi-aseb/
+├── hackathon-2026/
+│   ├── participants/
+│   │   ├── data.csv          # what the app reads
+│   │   └── source.xlsx       # the original upload, when it was a workbook
+│   └── template/
+│       └── template.png
+└── intro-to-git/
+    ├── participants/
+    │   └── data.csv
+    └── template/
+        └── template.jpg
+```
+
+Supabase renders key prefixes as folders, so this is browsable in the dashboard.
+Participant lists used to live in KV; KV is still read for events uploaded before
+the move, but new uploads go to the bucket. That also removes an old limit: KV
+writes put the whole value in the URL, so a few thousand rows would fail with a
+414. Bucket uploads send the file as a request body.
 
 A certificate link is a signed token containing the event slug and the printed
 name, not a pointer to a saved file. Any worker can serve any link, links survive
@@ -147,6 +172,7 @@ python tests/test_template_upload.py
 python tests/test_supabase_storage.py
 python tests/test_csrf.py
 python tests/test_email_templates.py
+python tests/test_participant_upload.py
 ```
 
 ## CSRF Protection
@@ -217,6 +243,17 @@ Notes:
 - slug must be lowercase letters, numbers, and hyphens only
 - text_x and text_y are center coordinates for certificate text
 - font_color is RGB list [r, g, b]
+
+## Participant Lists
+
+Upload a `.csv` or an Excel `.xlsx`. A workbook is read from its **first sheet**
+and converted to CSV once at upload time, so validation, dropdown suggestions and
+bulk generation all stay CSV-only. The header row sets the column count; blank
+rows are dropped, and ragged rows are padded or trimmed to match. The original
+workbook is kept next to the derived CSV in the bucket.
+
+CSV exported from Excel is read as `utf-8-sig`, so the byte-order mark Excel
+writes does not end up glued to the first column name.
 
 ## Email Templates
 

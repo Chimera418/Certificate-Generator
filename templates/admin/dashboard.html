@@ -3,99 +3,111 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Admin Dashboard – Certificate Portal</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Events &mdash; Admin</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
     <div class="admin-layout">
       <header class="admin-header">
-        <span class="admin-header-title">Certificate Portal &mdash; Admin</span>
+        <span class="admin-header-title">Certificate Portal</span>
         <div class="admin-header-actions">
-          <a href="{{ url_for('admin_logs') }}" class="admin-nav-link">View Logs</a>
-          <a href="{{ url_for('home') }}" class="admin-nav-link">View Site</a>
-          <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+          <a href="{{ url_for('admin_logs') }}" class="admin-nav-link">Logs</a>
+          <a href="{{ url_for('home') }}" class="admin-nav-link">View site</a>
+          <form action="{{ url_for('admin_logout') }}" method="post">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <button class="admin-nav-btn" type="submit">Log Out</button>
+            <button class="admin-nav-btn" type="submit">Sign out</button>
           </form>
         </div>
       </header>
 
       <main class="admin-main">
         <div class="admin-section-header">
-          <h2>Events</h2>
-          <a href="{{ url_for('admin_new_event') }}" class="button-link">+ New Event</a>
+          <div>
+            <h2>Events</h2>
+            <p class="admin-subtitle">
+              {{ events|length }} event{{ '' if events|length == 1 else 's' }}
+            </p>
+          </div>
+          <a href="{{ url_for('admin_new_event') }}" class="button-link">New event</a>
         </div>
 
         {% if events %}
         <div class="admin-table-wrap">
-          <table class="admin-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>URL</th>
-                <th>Validation</th>
-                <th>Status</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for event in events %}
-              <tr>
-                <td><strong>{{ event.name }}</strong></td>
-                <td>
-                  <a href="{{ url_for('event_page', slug=event.slug) }}" target="_blank" class="admin-table-link">
-                    /events/{{ event.slug }}
-                  </a>
-                </td>
-                <td>{{ validation_type_labels.get(event.validation_type, event.validation_type) }}</td>
-                <td>
-                  <span class="status-badge {{ 'active' if event.active else 'inactive' }}">
-                    {{ 'Active' if event.active else 'Inactive' }}
-                  </span>
-                </td>
-                <td class="admin-actions-cell">
-                  <a href="{{ url_for('admin_edit_event', slug=event.slug) }}" class="admin-action-link">Edit</a>
-                  <form action="{{ url_for('admin_toggle_event', slug=event.slug) }}" method="post" style="display:inline">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-                    <button class="admin-action-btn" type="submit">
-                      {{ 'Deactivate' if event.active else 'Activate' }}
-                    </button>
-                  </form>
-                  <a href="{{ url_for('admin_send_emails', slug=event.slug) }}" class="admin-action-link">Send Emails</a>
-                  <button class="admin-action-btn danger" type="button"
-                    onclick="toggleDeleteRow('{{ event.slug }}')">Delete</button>
-                </td>
-              </tr>
-              <tr id="delete-row-{{ event.slug }}" class="delete-confirm-row" style="display:none">
-                <td colspan="5">
-                  <form action="{{ url_for('admin_delete_event', slug=event.slug) }}" method="post"
+          <div class="admin-table">
+            {% for event in events %}
+            <div class="event-row">
+              <div class="event-row-main">
+                <div class="event-row-name">{{ event.name }}</div>
+                <div class="event-row-meta">
+                  <a href="{{ url_for('event_page', slug=event.slug) }}" target="_blank"
+                     rel="noopener" class="admin-table-link">/events/{{ event.slug }}</a>
+                  <span class="dot" aria-hidden="true">&middot;</span>
+                  <span>{{ validation_type_labels.get(event.validation_type, event.validation_type) }}</span>
+                </div>
+              </div>
+
+              <span class="status-badge {{ 'active' if event.active else 'inactive' }}">
+                {{ 'Live' if event.active else 'Draft' }}
+              </span>
+
+              <div class="admin-actions-cell">
+                <a href="{{ url_for('admin_edit_event', slug=event.slug) }}"
+                   class="admin-action-link">Edit</a>
+                <form action="{{ url_for('admin_toggle_event', slug=event.slug) }}" method="post">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                  <button class="admin-action-btn" type="submit">
+                    {{ 'Deactivate' if event.active else 'Activate' }}
+                  </button>
+                </form>
+                <a href="{{ url_for('admin_send_emails', slug=event.slug) }}"
+                   class="admin-action-link">Email</a>
+                <button class="admin-action-btn danger" type="button"
+                        onclick="toggleDeleteRow('{{ event.slug }}')">Delete</button>
+              </div>
+            </div>
+
+            <div id="delete-row-{{ event.slug }}" class="delete-confirm-row" hidden>
+              <form action="{{ url_for('admin_delete_event', slug=event.slug) }}" method="post"
                     class="delete-confirm-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-                    <span class="delete-confirm-label">
-                      Type <strong>{{ event.slug }}</strong> to confirm permanent deletion:
-                    </span>
-                    <input name="confirm" type="text" placeholder="{{ event.slug }}"
-                      class="delete-confirm-input" autocomplete="off" />
-                    <button class="button-link danger" type="submit">Delete</button>
-                    <button class="button-link secondary" type="button"
-                      onclick="toggleDeleteRow('{{ event.slug }}')">Cancel</button>
-                  </form>
-                </td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                <span class="delete-confirm-label">
+                  Type <strong>{{ event.slug }}</strong> to delete permanently
+                </span>
+                <input name="confirm" type="text" placeholder="{{ event.slug }}"
+                       class="delete-confirm-input" autocomplete="off" />
+                <span class="delete-confirm-actions">
+                  <button class="button-link danger" type="submit">Delete</button>
+                  <button class="button-link secondary" type="button"
+                          onclick="toggleDeleteRow('{{ event.slug }}')">Cancel</button>
+                </span>
+              </form>
+            </div>
+            {% endfor %}
+          </div>
         </div>
         {% else %}
-        <p class="muted-text">No events yet. <a href="{{ url_for('admin_new_event') }}">Create one.</a></p>
+        <div class="admin-card">
+          <div class="empty-state">
+            <p>No events yet.</p>
+            <p class="admin-subtitle">
+              <a href="{{ url_for('admin_new_event') }}" class="admin-table-link">Create the first one</a>
+            </p>
+          </div>
+        </div>
         {% endif %}
       </main>
     </div>
 
     <script>
       function toggleDeleteRow(slug) {
-        var row = document.getElementById('delete-row-' + slug);
-        row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+        const row = document.getElementById('delete-row-' + slug);
+        if (!row) return;
+        row.hidden = !row.hidden;
+        if (!row.hidden) {
+          const field = row.querySelector('.delete-confirm-input');
+          if (field) field.focus();
+        }
       }
     </script>
   </body>

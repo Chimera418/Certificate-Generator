@@ -18,14 +18,15 @@ services:
       # Secrets: set these in the Render dashboard, never in this file.
       - key: ADMIN_PASSWORD
         sync: false
-      # Supabase Storage holds the certificate templates.
+      # Supabase Storage holds templates and participant lists.
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
       - key: SUPABASE_BUCKET
-        value: certificate-templates
-      # Upstash KV holds event configs and participant CSVs.
+        value: csi-aseb
+      # Upstash KV holds event configs. Participant lists moved to Supabase and
+      # are only read from KV for events uploaded before that change.
       - key: KV_REST_API_URL
         sync: false
       - key: KV_REST_API_TOKEN

@@ -16,7 +16,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 from functools import wraps
-from io import BytesIO
+from io import BytesIO, StringIO
 from uuid import uuid4
 
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
@@ -95,7 +95,10 @@ _EVENT_STATE_CACHE_TTL_SEC = 2.0
 # visible to every worker. Local files stay as the dev / no-Supabase fallback.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
-SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "certificate-templates").strip()
+# One bucket for the club, one folder per event inside it. Supabase renders key
+# prefixes as folders, so the dashboard shows <event>/participants and
+# <event>/template. Bucket names cannot contain spaces, hence the slug form.
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "csi-aseb").strip()
 _SUPABASE_BUCKET_READY = False
 
 
@@ -165,6 +168,12 @@ TEMPLATE_CONTENT_TYPES = {
 }
 # Guards against decompression bombs: a 40 MP RGBA image is already ~160 MB decoded.
 MAX_TEMPLATE_PIXELS = 40_000_000
+
+PARTICIPANT_EXTENSIONS = (".csv", ".xlsx")
+PARTICIPANT_CONTENT_TYPES = {
+	".csv": "text/csv",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 VALIDATION_TYPES = {"player_team", "name_only", "email", "badge_id", "custom", "none"}
 VALIDATION_TYPE_LABELS = {
@@ -483,7 +492,16 @@ def _event_csv_key(slug: str) -> str:
 # ─── Certificate template storage ─────────────────────────────────────────────
 
 def _template_object_path(slug: str, ext: str) -> str:
+	return f"{slug}/template/template{ext}"
+
+
+def _legacy_template_object_path(slug: str, ext: str) -> str:
+	"""Where templates lived before the per-event folder layout."""
 	return f"events/{slug}/template{ext}"
+
+
+def _participants_object_path(slug: str, filename: str = "data.csv") -> str:
+	return f"{slug}/participants/{filename}"
 
 
 def template_ext_for(slug: str, config: dict | None = None) -> str:
@@ -518,12 +536,14 @@ def has_template(slug: str, config: dict | None = None) -> bool:
 def load_template_bytes(slug: str, config: dict | None = None) -> bytes | None:
 	ext = template_ext_for(slug, config)
 	if _supabase_enabled():
-		try:
-			data = _supabase_download(_template_object_path(slug, ext))
-			if data:
-				return data
-		except (urlerror.URLError, TimeoutError, OSError, ValueError):
-			pass
+		for object_path in (_template_object_path(slug, ext),
+							_legacy_template_object_path(slug, ext)):
+			try:
+				data = _supabase_download(object_path)
+				if data:
+					return data
+			except (urlerror.URLError, TimeoutError, OSError, ValueError):
+				break
 	path = os.path.join(_event_dir(slug), f"template{ext}")
 	if not os.path.exists(path):
 		path = _event_template_path(slug)
@@ -560,12 +580,19 @@ def save_template_bytes(slug: str, data: bytes, ext: str) -> str:
 	return hashlib.sha256(data).hexdigest()[:16]
 
 
-def delete_template_storage(slug: str) -> None:
+def delete_event_objects(slug: str) -> None:
+	"""Remove an event's whole folder: template, participant files, and legacy keys."""
 	if not _supabase_enabled():
 		return
+	paths = [_participants_object_path(slug)]
 	for ext in TEMPLATE_EXTENSIONS:
+		paths.append(_template_object_path(slug, ext))
+		paths.append(_legacy_template_object_path(slug, ext))
+	for ext in PARTICIPANT_EXTENSIONS:
+		paths.append(_participants_object_path(slug, f"source{ext}"))
+	for object_path in paths:
 		try:
-			_supabase_delete(_template_object_path(slug, ext))
+			_supabase_delete(object_path)
 		except (urlerror.URLError, TimeoutError, OSError, ValueError):
 			continue
 
@@ -708,6 +735,60 @@ def _load_event_config(slug: str) -> dict | None:
 	return config
 
 
+def xlsx_to_csv_text(data: bytes) -> str:
+	"""
+	Flatten the first worksheet of an .xlsx file to CSV text.
+
+	Everything downstream (validation, dropdowns, bulk generation) already speaks
+	CSV, so an upload is converted once here rather than teaching the rest of the
+	app about workbooks. The header row sets the column count; blank rows are
+	dropped and ragged rows are padded or trimmed to match.
+	"""
+	from openpyxl import load_workbook
+
+	workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+	try:
+		worksheet = workbook.worksheets[0]
+		rows: list[list[str]] = []
+		for raw_row in worksheet.iter_rows(values_only=True):
+			cells = ["" if value is None else str(value).strip() for value in raw_row]
+			while cells and cells[-1] == "":
+				cells.pop()
+			if not cells:
+				continue
+			rows.append(cells)
+	finally:
+		workbook.close()
+
+	if not rows:
+		return ""
+
+	width = len(rows[0])
+	output = StringIO()
+	writer = csv.writer(output)
+	for row in rows:
+		writer.writerow((row + [""] * width)[:width])
+	return output.getvalue()
+
+
+def participant_text_from_upload(data: bytes, ext: str) -> tuple[str | None, str | None]:
+	"""Return (csv_text, error). Accepts a .csv or .xlsx upload."""
+	if ext == ".xlsx":
+		# .xlsx is a zip container; anything else with that extension is a lie.
+		if data[:4] != b"PK\x03\x04":
+			return None, "That does not look like a valid .xlsx workbook."
+		try:
+			text = xlsx_to_csv_text(data)
+		except Exception:
+			return None, "Could not read that workbook. Try re-saving it, or upload a .csv."
+		if not text.strip():
+			return None, "The first sheet of that workbook is empty."
+		return text, None
+
+	# utf-8-sig strips the BOM that Excel writes when it exports CSV.
+	return data.decode("utf-8-sig", errors="replace"), None
+
+
 def _read_event_csv_from_file(slug: str) -> str | None:
 	path = _event_csv_path(slug)
 	if not os.path.exists(path):
@@ -720,13 +801,25 @@ def _read_event_csv_from_file(slug: str) -> str | None:
 
 
 def load_event_csv_text(slug: str) -> str | None:
-	"""Participant CSV text, cached briefly because one page view reads it repeatedly."""
+	"""
+	Participant CSV text, cached briefly because one page view reads it repeatedly.
+
+	Supabase is the store; KV is read only so events uploaded before the move keep
+	working, and the local file is the no-storage-configured fallback.
+	"""
 	cached = _EVENT_CSV_CACHE.get(slug)
 	if cached is not None and (time.time() - cached[1]) < _EVENT_CSV_CACHE_TTL_SEC:
 		return cached[0]
 
 	content: str | None = None
-	if _kv_enabled():
+	if _supabase_enabled():
+		try:
+			raw_bytes = _supabase_download(_participants_object_path(slug))
+			if raw_bytes:
+				content = raw_bytes.decode("utf-8-sig", errors="replace")
+		except (urlerror.URLError, TimeoutError, OSError, ValueError):
+			pass
+	if content is None and _kv_enabled():
 		try:
 			raw = _kv_get_raw(_event_csv_key(slug))
 			if isinstance(raw, str):
@@ -895,9 +988,42 @@ def save_event_config(slug: str, config: dict) -> None:
 			return
 
 
-def save_event_csv(slug: str, content: str) -> None:
-	_write_event_csv_to_file(slug, content)
+def save_event_csv(slug: str, content: str, source: tuple[bytes, str] | None = None) -> None:
+	"""
+	Persist the participant list.
+
+	`source` is the original upload as (bytes, extension); when it is a workbook
+	it is kept alongside the derived CSV so the organiser can download exactly
+	what they uploaded.
+	"""
+	try:
+		_write_event_csv_to_file(slug, content)
+	except OSError:
+		if not (_supabase_enabled() or _kv_enabled()):
+			raise
 	_EVENT_CSV_CACHE.pop(slug, None)
+
+	if _supabase_enabled():
+		_supabase_upload(
+			_participants_object_path(slug),
+			content.encode("utf-8"),
+			PARTICIPANT_CONTENT_TYPES[".csv"],
+		)
+		if source is not None and source[1] != ".csv":
+			raw_bytes, ext = source
+			try:
+				_supabase_upload(
+					_participants_object_path(slug, f"source{ext}"),
+					raw_bytes,
+					PARTICIPANT_CONTENT_TYPES.get(ext, "application/octet-stream"),
+				)
+			except (urlerror.URLError, TimeoutError, OSError, ValueError):
+				# Keeping the original is a convenience, not a requirement.
+				pass
+		_register_event_slug(slug)
+		return
+
+	# No Supabase configured: fall back to KV so existing deployments still work.
 	if _kv_enabled():
 		try:
 			_kv_set_raw(_event_csv_key(slug), content)
@@ -909,7 +1035,7 @@ def save_event_csv(slug: str, content: str) -> None:
 def delete_event_storage(slug: str) -> None:
 	if os.path.isdir(_event_dir(slug)):
 		shutil.rmtree(_event_dir(slug))
-	delete_template_storage(slug)
+	delete_event_objects(slug)
 	# Invalidate caches for the deleted event
 	global _EVENT_CONFIG_CACHE
 	_EVENT_CONFIG_CACHE.pop(slug, None)
@@ -1011,12 +1137,10 @@ def build_custom_form_fields(slug: str, custom_fields: list[str], custom_dropdow
 
 def validation_prompt_for_type(validation_type: str) -> str:
 	if validation_type == "email":
-		return "Registration Email"
+		return "Registration email"
 	if validation_type == "badge_id":
-		return "Roll No"
-	if validation_type == "name_only":
-		return "Registration Name"
-	return "Registration Name"
+		return "Roll number"
+	return "Registration name"
 
 
 def event_form_context(config: dict, slug: str, error: str | None = None) -> dict:
@@ -1779,16 +1903,26 @@ def admin_upload_csv(slug: str):
 		return render_template("admin/event_form.html", event=config, is_new=False,
 							   error="No file selected.", has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
-	if not secure_filename(file.filename).lower().endswith(".csv"):
+	filename = secure_filename(file.filename).lower()
+	ext = os.path.splitext(filename)[1]
+	if ext not in PARTICIPANT_EXTENSIONS:
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="Participants file must be a .csv.", has_template=template_present, has_csv=has_csv,
+							   error="Participants file must be a .csv or .xlsx.",
+							   has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
-	content = file.stream.read().decode("utf-8", errors="replace")
+
+	raw_upload = file.stream.read()
+	content, upload_error = participant_text_from_upload(raw_upload, ext)
+	if upload_error:
+		return render_template("admin/event_form.html", event=config, is_new=False,
+							   error=upload_error, has_template=template_present, has_csv=has_csv,
+							   csv_columns=csv_headers(slug)), 400
+
 	validation_type = config.get("validation_type", "player_team")
 	custom_fields: list[str] = config.get("custom_fields", [])
 	if validation_type == "custom" and not custom_fields:
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="Select at least one custom field in Event Settings before uploading CSV.",
+							   error="Pick at least one column to match on before uploading a participant list.",
 							   has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
 	required_headers = required_headers_for_validation(validation_type, custom_fields)
@@ -1797,22 +1931,33 @@ def admin_upload_csv(slug: str):
 		headers = {h.strip().lower() for h in (reader.fieldnames or [])}
 		if validation_type == "badge_id" and not ({"roll_no", "id", "badge_id", "badge_number"} & headers):
 			return render_template("admin/event_form.html", event=config, is_new=False,
-								   error="CSV must include one of: roll_no, id, badge_id, badge_number.",
+								   error="The file must include one of: roll_no, id, badge_id, badge_number.",
 								   has_template=template_present, has_csv=has_csv,
 								   csv_columns=sorted(headers)), 400
 		if not required_headers.issubset(headers):
 			missing = ", ".join(sorted(required_headers - headers))
 			return render_template("admin/event_form.html", event=config, is_new=False,
-								   error=f"CSV is missing required column(s): {missing}.",
-							   has_template=template_present, has_csv=has_csv,
-							   csv_columns=sorted(headers)), 400
+								   error=f"The file is missing required column(s): {missing}.",
+								   has_template=template_present, has_csv=has_csv,
+								   csv_columns=sorted(headers)), 400
 	except Exception:
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="Could not parse CSV file.", has_template=template_present, has_csv=has_csv,
+							   error="Could not read that participant list.",
+							   has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
-	save_event_csv(slug, content)
+
+	try:
+		save_event_csv(slug, content, source=(raw_upload, ext))
+	except Exception:
+		return render_template("admin/event_form.html", event=config, is_new=False,
+							   error="Could not save the participant list to storage. Check the Supabase settings and try again.",
+							   has_template=template_present, has_csv=has_csv,
+							   csv_columns=csv_headers(slug)), 502
+
+	converted = " Converted from the first sheet of the workbook." if ext == ".xlsx" else ""
 	return render_template("admin/event_form.html", event=config, is_new=False,
-						   success="Participants CSV uploaded.", error=None, has_template=template_present, has_csv=True,
+						   success=f"Participant list uploaded.{converted}", error=None,
+						   has_template=template_present, has_csv=True,
 						   csv_columns=csv_headers(slug))
 
 

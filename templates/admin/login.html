@@ -3,13 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Admin Login – Certificate Portal</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Admin &mdash; Certificate Portal</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
     <main class="page">
       <section class="card">
-        <h1>Admin Login</h1>
+        <h1>Admin</h1>
+        <p class="card-subtitle">Sign in to manage events.</p>
 
         {% if error %}
         <p class="error">{{ error }}</p>
@@ -26,11 +28,11 @@
             autocomplete="current-password"
             required
           />
-          <button type="submit">Log In</button>
+          <button type="submit">Sign in</button>
         </form>
 
         <div class="back-link-row">
-          <a href="{{ url_for('home') }}" class="back-link">← Back to site</a>
+          <a href="{{ url_for('home') }}" class="back-link">&larr; Back to site</a>
         </div>
       </section>
     </main>

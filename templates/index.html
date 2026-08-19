@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>Certificate Portal</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
@@ -17,16 +18,16 @@
           <li>
             <a class="event-link" href="{{ url_for('event_page', slug=event.slug) }}">
               <span class="event-link-name">{{ event.name }}</span>
-              <span class="event-arrow">→</span>
+              <span class="event-arrow" aria-hidden="true">&rarr;</span>
             </a>
           </li>
           {% endfor %}
         </ul>
         {% else %}
-        <p class="muted-text">No events are currently available. Check back later.</p>
+        <p class="listing-intro">No events are open right now. Check back later.</p>
         {% endif %}
       </section>
     </main>
-    <footer class="site-footer">Crafted with 💕 -- CSI</footer>
+    <footer class="site-footer">Built by CSI</footer>
   </body>
 </html>

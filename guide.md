@@ -27,9 +27,13 @@ certificate_generator/
 
 In a real deployment the web server's disk is disposable:
 
-- **Templates** go to Supabase Storage. Set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
+- **Templates and participant lists** go to Supabase Storage, in one club bucket
+  with a folder per event: `csi-aseb/<event>/template/` and
+  `csi-aseb/<event>/participants/`. Set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY`
   and the bucket is created for you on the first upload.
-- **Configs and participant CSVs** go to the KV store.
+- **Participant lists accept `.csv` or Excel `.xlsx`.** A workbook is converted
+  from its first sheet at upload time; the original is kept in the bucket too.
+- **Event configs** go to the KV store.
 - **Certificates are never stored.** A certificate link is a signed token holding the
   event slug and the printed name; the image is rendered fresh on each request. That
   means links keep working after a redeploy, and nothing needs cleaning up.
@@ -49,7 +53,7 @@ SECRET_KEY=your_random_secret_string
 # Supabase Storage (certificate templates)
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your_service_role_key
-SUPABASE_BUCKET=certificate-templates
+SUPABASE_BUCKET=csi-aseb
 
 # SMTP Email Configuration (Example for Outlook)
 SMTP_HOST=smtp-mail.outlook.com
@@ -70,7 +74,9 @@ Every event gets its own folder inside `events/`. The name of the folder is the 
 Inside each event folder, you need 3 things:
 
 1. **`template.png`**: The blank certificate design.
-2. **`data.csv`**: A CSV file containing at least `name` and `email` columns.
+2. **`data.csv`**: A participant list with at least `name` and `email` columns.
+   Through the admin panel you can upload `.csv` or `.xlsx`; on the filesystem it
+   must be `data.csv`.
 3. **`config.json`**: The rules for rendering text onto the image.
 
 ### Using Layout Profiles (`profiles.yaml`)

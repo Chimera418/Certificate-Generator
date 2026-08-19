@@ -3,173 +3,60 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Coordinate Editor – {{ event.name }} – Admin</title>
+    <meta name="color-scheme" content="dark" />
+    <title>Placement &mdash; {{ event.name }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
-    <style>
-      body {
-        overflow: hidden;
-      }
-      .coord-editor-layout {
-        display: flex;
-        height: 100vh;
-        background:
-          radial-gradient(circle at top, rgba(97, 168, 255, 0.18), transparent 32%),
-          linear-gradient(180deg, var(--bg-accent) 0%, var(--bg) 100%);
-      }
-      .coord-editor-canvas {
-        flex: 1;
-        background: rgba(7, 17, 31, 0.45);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 1rem;
-        overflow: auto;
-        position: relative;
-      }
-      #certEditorCanvas {
-        max-width: 100%;
-        max-height: 100%;
-        cursor: crosshair;
-        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.38);
-        border-radius: 8px;
-      }
-      .coord-editor-panel {
-        width: 300px;
-        background: rgba(13, 24, 42, 0.96);
-        border-left: 1px solid var(--border);
-        padding: 1.5rem;
-        overflow-y: auto;
-        display: flex;
-        flex-direction: column;
-        backdrop-filter: blur(16px);
-      }
-      .coord-editor-panel h3 {
-        margin: 0 0 1rem;
-        font-size: 1.1rem;
-      }
-      .coord-editor-control {
-        margin-bottom: 1.25rem;
-      }
-      .coord-editor-control label {
-        display: block;
-        margin-bottom: 0.4rem;
-        font-weight: 600;
-        font-size: 0.9rem;
-        color: var(--text);
-      }
-      .coord-editor-control input,
-      .coord-editor-control select {
-        width: 100%;
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        padding: 0.6rem;
-        font-size: 0.95rem;
-        background: var(--surface);
-        color: var(--text);
-      }
-      .coord-editor-control input:focus,
-      .coord-editor-control select:focus {
-        outline: none;
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-soft);
-      }
-      .coord-editor-control input[type="color"] {
-        appearance: none;
-        -webkit-appearance: none;
-        min-height: 44px;
-        padding: 0.2rem;
-        cursor: pointer;
-      }
-      .coord-editor-control input[type="color"]::-webkit-color-swatch-wrapper {
-        padding: 0;
-      }
-      .coord-editor-control input[type="color"]::-webkit-color-swatch {
-        border: none;
-        border-radius: 6px;
-      }
-      .coord-editor-control input[type="color"]::-moz-color-swatch {
-        border: none;
-        border-radius: 6px;
-      }
-      .coord-editor-actions {
-        margin-top: auto;
-        display: flex;
-        flex-direction: column;
-        gap: 0.75rem;
-      }
-      .coord-editor-btn {
-        border: none;
-        border-radius: 8px;
-        padding: 0.75rem 1rem;
-        font-size: 0.95rem;
-        font-weight: 600;
-        cursor: pointer;
-        transition: all 0.15s;
-      }
-      .coord-editor-btn.primary {
-        background: var(--accent);
-        color: #fff;
-      }
-      .coord-editor-btn.primary:hover {
-        background: var(--accent-hover);
-      }
-      .coord-editor-btn.secondary {
-        background: #31445f;
-        color: var(--text);
-      }
-      .coord-editor-btn.secondary:hover {
-        background: #3c5474;
-      }
-      .coord-info {
-        font-size: 0.85rem;
-        color: var(--muted);
-        background: rgba(16, 32, 56, 0.72);
-        padding: 0.75rem;
-        border-radius: 6px;
-        margin-top: 1rem;
-        border-left: 3px solid var(--accent);
-      }
-    </style>
   </head>
   <body>
     <div class="coord-editor-layout">
       <div class="coord-editor-canvas">
         <canvas id="certEditorCanvas"></canvas>
       </div>
+
       <div class="coord-editor-panel">
-        <h3>Text Position</h3>
-        <p class="field-hint" id="coordSaveStatus">Settings autosave after changes.</p>
-        <form id="editorForm" method="post" action="{{ url_for('admin_update_config', slug=event.slug) }}">
+        <h3>Position</h3>
+        <p class="admin-subtitle" id="coordSaveStatus">Changes save automatically.</p>
+
+        <form id="editorForm" method="post"
+              action="{{ url_for('admin_update_config', slug=event.slug) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-          <div class="coord-editor-control">
-            <label for="text_x">X Position (px)</label>
-            <input
-              id="text_x" name="text_x" type="number" min="0"
-              value="{{ event.text_x if event else 1789 }}"
-            />
+
+          <div class="coord-row">
+            <div class="coord-editor-control">
+              <label for="text_x">X</label>
+              <input id="text_x" name="text_x" class="coord-input" type="number" min="0"
+                     value="{{ event.text_x if event else 1789 }}" />
+            </div>
+            <div class="coord-editor-control">
+              <label for="text_y">Y</label>
+              <input id="text_y" name="text_y" class="coord-input" type="number" min="0"
+                     value="{{ event.text_y if event else 1440 }}" />
+            </div>
           </div>
 
-          <div class="coord-editor-control">
-            <label for="text_y">Y Position (px)</label>
-            <input
-              id="text_y" name="text_y" type="number" min="0"
-              value="{{ event.text_y if event else 1440 }}"
-            />
-          </div>
+          <h3>Type</h3>
 
-          <h3 style="margin-top: 1.5rem;">Text Style</h3>
-
-          <div class="coord-editor-control">
-            <label for="font_size">Font Size (px)</label>
-            <input
-              id="font_size" name="font_size" type="number" min="8"
-              value="{{ event.font_size if event else 100 }}"
-            />
+          <div class="coord-row">
+            <div class="coord-editor-control">
+              <label for="font_size">Size</label>
+              <input id="font_size" name="font_size" class="coord-input" type="number" min="8"
+                     value="{{ event.font_size if event else 100 }}" />
+            </div>
+            <div class="coord-editor-control">
+              <label for="font_color">Colour</label>
+              {% if event and event.font_color %}
+                {% set fc = event.font_color %}
+                <input id="font_color" name="font_color" type="color"
+                       value="#{{ '%02x%02x%02x' % (fc[0], fc[1], fc[2]) }}" />
+              {% else %}
+                <input id="font_color" name="font_color" type="color" value="#321812" />
+              {% endif %}
+            </div>
           </div>
 
           {% set selected_font_key = event.font_key if event and event.font_key else default_font_key %}
           <div class="coord-editor-control">
-            <label for="font_key">Font Family</label>
+            <label for="font_key">Typeface</label>
             <select id="font_key" name="font_key">
               {% for option in font_options %}
               <option
@@ -183,36 +70,23 @@
             </select>
           </div>
 
-          <div class="coord-editor-control">
-            <label for="font_color">Font Color</label>
-            {% if event and event.font_color %}
-              {% set fc = event.font_color %}
-              <input id="font_color" name="font_color" type="color"
-                value="#{{ '%02x%02x%02x' % (fc[0], fc[1], fc[2]) }}"
-              />
-            {% else %}
-              <input id="font_color" name="font_color" type="color" value="#321812" />
-            {% endif %}
-          </div>
-
-          <h3 style="margin-top: 1.5rem;">Preview Text</h3>
+          <h3>Preview</h3>
 
           <div class="coord-editor-control">
-            <label for="sample_text">Sample Text (for preview only)</label>
-            <input
-              id="sample_text" type="text"
-              value="Sample Text"
-              placeholder="Enter preview text..."
-            />
+            <label for="sample_text">Sample text</label>
+            <input id="sample_text" type="text" value="Sample Text"
+                   placeholder="Sample Text" autocomplete="off" />
           </div>
 
-          <div class="coord-info">
-            <strong>💡 Tip:</strong> Drag the text marker on the certificate to adjust position, or edit values directly.
-          </div>
+          <p class="coord-info">
+            <strong>Tip.</strong> Drag the marker on the certificate to move the name,
+            or type exact coordinates above.
+          </p>
 
           <div class="coord-editor-actions">
-            <button type="button" id="saveEditorButton" class="coord-editor-btn primary">✓ Save Changes</button>
-            <a href="{{ url_for('admin_edit_event', slug=event.slug) }}" class="coord-editor-btn secondary" style="text-align: center; text-decoration: none; color: var(--text);">← Back to Event</a>
+            <button type="button" id="saveEditorButton" class="coord-editor-btn">Save changes</button>
+            <a href="{{ url_for('admin_edit_event', slug=event.slug) }}"
+               class="button-link secondary coord-editor-btn">Back to event</a>
           </div>
         </form>
       </div>
@@ -248,28 +122,26 @@
       const loadedPreviewFonts = new Set();
 
       function selectedPreviewFont() {
-        const selectedOption = fontKeyInput && fontKeyInput.selectedOptions
+        const selected = fontKeyInput && fontKeyInput.selectedOptions
           ? fontKeyInput.selectedOptions[0]
           : null;
         return {
-          family: (selectedOption && selectedOption.dataset.family) || 'Montserrat Bold',
-          weight: (selectedOption && selectedOption.dataset.weight) || '700',
-          url: (selectedOption && selectedOption.dataset.url) || ''
+          family: (selected && selected.dataset.family) || 'Montserrat Bold',
+          weight: (selected && selected.dataset.weight) || '700',
+          url: (selected && selected.dataset.url) || ''
         };
       }
 
       function ensurePreviewFontLoaded() {
         const font = selectedPreviewFont();
-        if (!document.fonts) {
-          return Promise.resolve();
-        }
+        if (!document.fonts) return Promise.resolve();
         if (loadedPreviewFonts.has(font.family)) {
           return document.fonts.load(`${font.weight} 32px "${font.family}"`).catch(() => undefined);
         }
         if (window.FontFace && font.url) {
           const face = new FontFace(font.family, `url(${font.url})`, { weight: font.weight });
-          return face.load().then((loadedFace) => {
-            document.fonts.add(loadedFace);
+          return face.load().then((loaded) => {
+            document.fonts.add(loaded);
             loadedPreviewFonts.add(font.family);
             return document.fonts.load(`${font.weight} 32px "${font.family}"`);
           }).catch(() => undefined);
@@ -289,52 +161,43 @@
           coordAutosaveQueued = true;
           return Promise.resolve(false);
         }
-
         coordAutosaveInFlight = true;
         coordAutosaveQueued = false;
-        setCoordSaveStatus('Saving changes...', false);
+        setCoordSaveStatus('Saving...', false);
 
         return fetch(form.action, {
           method: 'POST',
           body: new FormData(form),
-          headers: {
-            'X-Requested-With': 'XMLHttpRequest'
-          }
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
         })
           .then(async (response) => {
-            if (!response.ok) {
-              throw new Error('Save failed');
-            }
+            if (!response.ok) throw new Error('Save failed');
             return response.json();
           })
           .then(() => {
-            setCoordSaveStatus('Settings saved automatically.', false);
+            setCoordSaveStatus('Saved.', false);
             return true;
           })
           .catch(() => {
-            setCoordSaveStatus('Autosave failed. Use Save Changes to retry.', true);
+            setCoordSaveStatus('Autosave failed. Use Save changes to retry.', true);
             return false;
           })
           .finally(() => {
             coordAutosaveInFlight = false;
-            if (coordAutosaveQueued) {
-              runCoordAutosave();
-            }
+            if (coordAutosaveQueued) runCoordAutosave();
           });
       }
 
       function scheduleCoordAutosave() {
-        if (coordAutosaveTimer) {
-          clearTimeout(coordAutosaveTimer);
-        }
-        setCoordSaveStatus('Unsaved changes...', false);
+        if (coordAutosaveTimer) clearTimeout(coordAutosaveTimer);
+        setCoordSaveStatus('Unsaved changes', false);
         coordAutosaveTimer = setTimeout(runCoordAutosave, 500);
       }
 
       function resizeCanvas() {
         const container = canvas.parentElement;
-        maxCanvasWidth = container.clientWidth - 20;
-        maxCanvasHeight = container.clientHeight - 20;
+        maxCanvasWidth = container.clientWidth - 32;
+        maxCanvasHeight = container.clientHeight - 32;
         drawPreview();
       }
 
@@ -348,10 +211,10 @@
           certImage = null;
           ctx.clearRect(0, 0, canvas.width, canvas.height);
           const fallbackFont = selectedPreviewFont();
-          ctx.fillStyle = '#999';
-          ctx.font = `${fallbackFont.weight} 20px "${fallbackFont.family}", Arial`;
+          ctx.fillStyle = '#85858f';
+          ctx.font = `${fallbackFont.weight} 16px "${fallbackFont.family}", Arial`;
           ctx.textAlign = 'center';
-          ctx.fillText('Preview not available', canvas.width / 2, canvas.height / 2);
+          ctx.fillText('Preview unavailable', canvas.width / 2, canvas.height / 2);
         };
         img.src = `${templatePreviewUrl}?t=${Date.now()}`;
       }
@@ -360,27 +223,26 @@
         try {
           sessionStorage.setItem(sampleTextStorageKey, sampleTextInput.value || '');
         } catch (error) {
+          /* private browsing */
         }
       }
 
       function restoreSampleText() {
         try {
-          const storedValue = sessionStorage.getItem(sampleTextStorageKey);
-          if (storedValue !== null) {
-            sampleTextInput.value = storedValue;
-          }
+          const stored = sessionStorage.getItem(sampleTextStorageKey);
+          if (stored !== null) sampleTextInput.value = stored;
         } catch (error) {
+          /* private browsing */
         }
       }
 
       function drawPreview() {
         if (!certImage) return;
 
-        // Calculate scaling to fit canvas while maintaining aspect ratio
+        // Fit the template inside the canvas area, preserving aspect ratio.
         const imgAspect = certImage.width / certImage.height;
         let drawWidth = maxCanvasWidth;
         let drawHeight = drawWidth / imgAspect;
-
         if (drawHeight > maxCanvasHeight) {
           drawHeight = maxCanvasHeight;
           drawWidth = drawHeight * imgAspect;
@@ -388,36 +250,32 @@
 
         scaleX = drawWidth / certImage.width;
         scaleY = drawHeight / certImage.height;
-
         canvas.width = drawWidth;
         canvas.height = drawHeight;
 
-        // Draw certificate template image
         ctx.drawImage(certImage, 0, 0, drawWidth, drawHeight);
 
-        const x = parseInt(textXInput.value) * scaleX;
-        const y = parseInt(textYInput.value) * scaleY;
-        const size = parseInt(fontSizeInput.value) * scaleX / 2;
+        const x = parseInt(textXInput.value, 10) * scaleX;
+        const y = parseInt(textYInput.value, 10) * scaleY;
+        const size = (parseInt(fontSizeInput.value, 10) * scaleX) / 2;
         const color = fontColorInput.value || '#321812';
         const displayText = sampleTextInput.value.trim() || 'Sample Text';
         const font = selectedPreviewFont();
 
-        // Highlight the draggable area
         if (isDragging) {
-          ctx.fillStyle = 'rgba(45, 108, 223, 0.1)';
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
           ctx.beginPath();
           ctx.arc(x, y, size * 1.8, 0, Math.PI * 2);
           ctx.fill();
         }
 
-        // Crosshair circle
+        // Marker: a ring plus crosshair, drawn in the text colour so it stays visible.
         ctx.strokeStyle = color;
-        ctx.lineWidth = 3;
+        ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.arc(x, y, size, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Crosshair lines
         ctx.beginPath();
         ctx.moveTo(x - size * 1.5, y);
         ctx.lineTo(x + size * 1.5, y);
@@ -426,70 +284,64 @@
         ctx.stroke();
 
         ctx.fillStyle = color;
-        ctx.font = `${font.weight} ${Math.max(12, parseInt(fontSizeInput.value) * scaleX)}px "${font.family}", Arial`;
+        ctx.font = `${font.weight} ${Math.max(10, parseInt(fontSizeInput.value, 10) * scaleX)}px "${font.family}", Arial`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(displayText, x, y);
-
       }
 
-      // Handle canvas mousedown to start dragging
-      canvas.addEventListener('mousedown', (e) => {
+      // Pointer events rather than mouse events, so dragging works on touch too.
+      canvas.addEventListener('pointerdown', (event) => {
         if (!certImage) return;
         const rect = canvas.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
+        const pointerX = event.clientX - rect.left;
+        const pointerY = event.clientY - rect.top;
 
-        const textX = parseInt(textXInput.value) * scaleX;
-        const textY = parseInt(textYInput.value) * scaleY;
-        const size = parseInt(fontSizeInput.value) * scaleX / 2;
+        const textX = parseInt(textXInput.value, 10) * scaleX;
+        const textY = parseInt(textYInput.value, 10) * scaleY;
+        const size = (parseInt(fontSizeInput.value, 10) * scaleX) / 2;
 
-        // Check if click is near the text position (within 2x the text marker size)
-        const distX = mouseX - textX;
-        const distY = mouseY - textY;
-        const distance = Math.sqrt(distX * distX + distY * distY);
+        const distX = pointerX - textX;
+        const distY = pointerY - textY;
+        // Generous on touch: never smaller than a finger-sized target.
+        const grabRadius = Math.max(size * 2, 28);
 
-        if (distance < size * 2) {
+        if (Math.sqrt(distX * distX + distY * distY) < grabRadius) {
           isDragging = true;
           dragOffsetX = distX;
           dragOffsetY = distY;
+          canvas.setPointerCapture(event.pointerId);
           canvas.style.cursor = 'grabbing';
+          event.preventDefault();
         }
       });
 
-      // Handle canvas mousemove for dragging
-      canvas.addEventListener('mousemove', (e) => {
+      canvas.addEventListener('pointermove', (event) => {
         if (!isDragging || !certImage) return;
-
         const rect = canvas.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-
-        const newX = Math.round((mouseX - dragOffsetX) / scaleX);
-        const newY = Math.round((mouseY - dragOffsetY) / scaleY);
-
+        const newX = Math.round((event.clientX - rect.left - dragOffsetX) / scaleX);
+        const newY = Math.round((event.clientY - rect.top - dragOffsetY) / scaleY);
         textXInput.value = Math.max(0, newX);
         textYInput.value = Math.max(0, newY);
         drawPreview();
+        event.preventDefault();
       });
 
-      // Handle canvas mouseup to stop dragging
-      canvas.addEventListener('mouseup', () => {
+      function endDrag(event) {
+        if (!isDragging) return;
         isDragging = false;
         canvas.style.cursor = 'crosshair';
-        scheduleCoordAutosave();
-      });
-
-      canvas.addEventListener('mouseleave', () => {
-        if (isDragging) {
-          scheduleCoordAutosave();
+        if (event && event.pointerId !== undefined && canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
         }
-        isDragging = false;
-        canvas.style.cursor = 'crosshair';
-      });
+        drawPreview();
+        scheduleCoordAutosave();
+      }
 
-      // Update preview when inputs change
-      [textXInput, textYInput, fontSizeInput, fontColorInput, sampleTextInput].forEach(input => {
+      canvas.addEventListener('pointerup', endDrag);
+      canvas.addEventListener('pointercancel', endDrag);
+
+      [textXInput, textYInput, fontSizeInput, fontColorInput, sampleTextInput].forEach((input) => {
         input.addEventListener('input', drawPreview);
       });
       if (fontKeyInput) {
@@ -508,34 +360,23 @@
           saveEditorButton.textContent = 'Saving...';
           try {
             const didSave = await runCoordAutosave();
+            saveEditorButton.textContent = didSave ? 'Saved' : originalLabel;
             if (didSave) {
-              saveEditorButton.textContent = 'Saved';
-              window.setTimeout(() => {
-                saveEditorButton.textContent = originalLabel;
-              }, 900);
-            } else {
-              saveEditorButton.textContent = originalLabel;
+              window.setTimeout(() => { saveEditorButton.textContent = originalLabel; }, 900);
             }
           } finally {
-            window.setTimeout(() => {
-              saveEditorButton.disabled = false;
-            }, 150);
+            window.setTimeout(() => { saveEditorButton.disabled = false; }, 150);
           }
         });
       }
 
-      [textXInput, textYInput, fontSizeInput].forEach(input => {
+      [textXInput, textYInput, fontSizeInput].forEach((input) => {
         input.addEventListener('input', scheduleCoordAutosave);
       });
       fontColorInput.addEventListener('change', scheduleCoordAutosave);
-      if (fontKeyInput) {
-        fontKeyInput.addEventListener('change', scheduleCoordAutosave);
-      }
+      if (fontKeyInput) fontKeyInput.addEventListener('change', scheduleCoordAutosave);
 
-      // Handle window resize
       window.addEventListener('resize', resizeCanvas);
-
-      // Load template on page load
       window.addEventListener('load', () => {
         restoreSampleText();
         loadCertImage();

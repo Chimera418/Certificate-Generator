@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>Certificate Preview</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
@@ -10,26 +11,32 @@
     <main class="page">
       <section class="card preview-card">
         {% if event %}<h1>{{ event.name }}</h1>{% else %}<h1>Certificate Preview</h1>{% endif %}
-        <p class="card-subtitle">Your certificate is ready, {{ cert_name }}!</p>
+        <p class="card-subtitle">Ready to download, {{ cert_name }}.</p>
 
         <div class="preview-frame">
           <img
             src="{{ url_for('preview_image', token=cert_token) }}"
-            alt="Generated certificate preview"
+            alt="Preview of the generated certificate"
             class="preview-image"
           />
         </div>
 
         <div class="preview-actions">
-          <a class="button-link" href="{{ url_for('download_file', token=cert_token) }}">Download Certificate</a>
+          <a class="button-link" href="{{ url_for('download_file', token=cert_token) }}">
+            Download certificate
+          </a>
           {% if event %}
           <a class="button-link secondary" href="{{ url_for('event_page', slug=event.slug) }}">Back</a>
           {% else %}
           <a class="button-link secondary" href="{{ url_for('home') }}">Back</a>
           {% endif %}
         </div>
+
+        <p class="field-hint">
+          The preview is shown at reduced size. The downloaded file is full resolution.
+        </p>
       </section>
     </main>
-    <footer class="site-footer">Crafted with 💕 -- CSI</footer>
+    <footer class="site-footer">Built by CSI</footer>
   </body>
 </html>

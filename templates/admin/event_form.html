@@ -3,27 +3,34 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{{ 'New Event' if is_new else 'Edit: ' + event.name }} – Admin</title>
+    <meta name="color-scheme" content="dark" />
+    <title>{{ 'New event' if is_new else event.name }} &mdash; Admin</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
     <div class="admin-layout">
       <header class="admin-header">
-        <span class="admin-header-title">Certificate Portal &mdash; Admin</span>
+        <span class="admin-header-title">Certificate Portal</span>
         <div class="admin-header-actions">
-          <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">← Dashboard</a>
-          <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+          <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">Events</a>
+          <form action="{{ url_for('admin_logout') }}" method="post">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <button class="admin-nav-btn" type="submit">Log Out</button>
+            <button class="admin-nav-btn" type="submit">Sign out</button>
           </form>
         </div>
       </header>
 
       <main class="admin-main">
-        <h2>{{ 'Create New Event' if is_new else 'Edit: ' + event.name }}</h2>
-        {% if not is_new %}
-        <p class="field-hint" id="configSaveStatus">Settings autosave after changes.</p>
-        {% endif %}
+        <div class="admin-section-header">
+          <div>
+            <h2>{{ 'New event' if is_new else event.name }}</h2>
+            {% if not is_new %}
+            <p class="admin-subtitle" id="configSaveStatus">Changes save automatically.</p>
+            {% else %}
+            <p class="admin-subtitle">Create the event, then add a template and participants.</p>
+            {% endif %}
+          </div>
+        </div>
 
         {% if error %}
         <p class="error">{{ error }}</p>
@@ -32,86 +39,97 @@
         <p class="success-msg">{{ success }}</p>
         {% endif %}
 
-        <!-- ── Event Settings ── -->
-        <div class="admin-form-section">
-          <h3>Event Settings</h3>
-          <form
-            action="{{ url_for('admin_create_event') if is_new else url_for('admin_update_config', slug=event.slug) }}"
-            method="post"
-            class="form admin-form"
-          >
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <label for="name">Event Name</label>
-            <input
-              id="name" name="name" type="text"
-              value="{{ event.name if event else '' }}"
-              placeholder="e.g. Hackathon 2026"
-              required
-            />
+        <form
+          action="{{ url_for('admin_create_event') if is_new else url_for('admin_update_config', slug=event.slug) }}"
+          method="post"
+        >
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
 
-            {% if is_new %}
-            <label for="slug">Slug (URL identifier)</label>
-            <input
-              id="slug" name="slug" type="text"
-              value="{{ event.slug if event else '' }}"
-              placeholder="e.g. hackathon-2026"
-              pattern="[a-z0-9][a-z0-9\-]*"
-              required
-            />
-            <p class="field-hint">Lowercase letters, numbers, and hyphens only. Cannot be changed after creation.</p>
-            {% endif %}
+          <!-- Details -->
+          <div class="admin-form-section">
+            <h3>Details</h3>
+            <p class="admin-subtitle">Shown to participants on the event page.</p>
 
-            <!-- Validation Type Selection (RADIO BUTTONS) -->
+            <div class="admin-form form">
+              <label for="name">Event name</label>
+              <input
+                id="name" name="name" type="text"
+                value="{{ event.name if event else '' }}"
+                placeholder="e.g. Hackathon 2026"
+                required
+              />
+
+              {% if is_new %}
+              <label for="slug">URL slug</label>
+              <input
+                id="slug" name="slug" type="text"
+                value="{{ event.slug if event else '' }}"
+                placeholder="e.g. hackathon-2026"
+                pattern="[a-z0-9][a-z0-9\-]*"
+                required
+              />
+              <p class="field-hint">
+                Lowercase letters, numbers and hyphens. Permanent once created.
+              </p>
+              {% endif %}
+            </div>
+          </div>
+
+          <!-- Validation -->
+          <div class="admin-form-section">
+            <h3>Validation</h3>
+            <p class="admin-subtitle">How a participant proves they are on the list.</p>
+
             <fieldset class="validation-type-group">
-              <legend>Validation Type</legend>
+              <legend>Validation type</legend>
               <label class="validation-option">
                 <input type="radio" name="validation_type" value="player_team"
                   {{ 'checked' if (not event or event.validation_type == 'player_team') else '' }} />
                 <strong>Player + Team</strong>
-                <span class="validation-desc">Participants must match both player name and team.</span>
-                <span class="validation-csv">CSV columns: <code>player</code>, <code>team</code></span>
+                <span class="validation-desc">Both the player name and the team must match.</span>
+                <span class="validation-csv">CSV: <code>player</code>, <code>team</code></span>
               </label>
               <label class="validation-option">
                 <input type="radio" name="validation_type" value="name_only"
                   {{ 'checked' if event and event.validation_type == 'name_only' else '' }} />
-                <strong>Name Only</strong>
-                <span class="validation-desc">Participants are validated by name only (no team).</span>
-                <span class="validation-csv">CSV column: <code>name</code></span>
+                <strong>Name only</strong>
+                <span class="validation-desc">Matched on the participant name alone.</span>
+                <span class="validation-csv">CSV: <code>name</code></span>
               </label>
               <label class="validation-option">
                 <input type="radio" name="validation_type" value="email"
                   {{ 'checked' if event and event.validation_type == 'email' else '' }} />
                 <strong>Email</strong>
-                <span class="validation-desc">Participants are validated by email.</span>
-                <span class="validation-csv">CSV column: <code>email</code></span>
+                <span class="validation-desc">Matched on the registration email.</span>
+                <span class="validation-csv">CSV: <code>email</code></span>
               </label>
               <label class="validation-option">
                 <input type="radio" name="validation_type" value="badge_id"
                   {{ 'checked' if event and event.validation_type == 'badge_id' else '' }} />
-                <strong>Roll No</strong>
-                <span class="validation-desc">Participants are validated by roll number.</span>
-                <span class="validation-csv">CSV one of: <code>roll_no</code>, <code>id</code>, <code>badge_id</code>, <code>badge_number</code></span>
+                <strong>Roll number</strong>
+                <span class="validation-desc">Matched on a roll or badge number.</span>
+                <span class="validation-csv">CSV: one of <code>roll_no</code>, <code>id</code>, <code>badge_id</code>, <code>badge_number</code></span>
               </label>
               <label class="validation-option">
                 <input type="radio" name="validation_type" value="custom"
                   {{ 'checked' if event and event.validation_type == 'custom' else '' }} />
-                <strong>Custom Fields</strong>
-                <span class="validation-desc">Validate using multiple CSV columns selected below.</span>
-                <span class="validation-csv">CSV: select one or more columns</span>
+                <strong>Custom fields</strong>
+                <span class="validation-desc">Matched on the CSV columns you pick below.</span>
+                <span class="validation-csv">CSV: your choice of columns</span>
               </label>
               <label class="validation-option">
                 <input type="radio" name="validation_type" value="none"
                   {{ 'checked' if event and event.validation_type == 'none' else '' }} />
-                <strong>No Validation</strong>
-                <span class="validation-desc">Anyone can request a certificate; no participant checks.</span>
+                <strong>None</strong>
+                <span class="validation-desc">Anyone with the link can generate a certificate.</span>
                 <span class="validation-csv">CSV optional</span>
               </label>
             </fieldset>
 
             <div class="custom-columns-panel" id="customFieldsPanel">
-              <h3>Custom Validation Columns</h3>
+              <h3>Columns to match on</h3>
               {% if csv_columns is defined and csv_columns %}
-              <p class="field-hint">Used only when <strong>Custom Fields</strong> is selected.</p>
+              <p class="field-hint">Used only by the Custom fields mode.</p>
               <div class="custom-columns-grid">
                 {% for col in csv_columns %}
                 <div class="custom-column-option">
@@ -123,42 +141,46 @@
                   <label class="custom-column-dropdown">
                     <input type="checkbox" name="custom_dropdown_fields" value="{{ col }}"
                       {{ 'checked' if event and event.custom_dropdown_fields and (col in event.custom_dropdown_fields) else '' }} />
-                    <span>Use dropdown suggestions</span>
+                    <span>Suggest values</span>
                   </label>
                 </div>
                 {% endfor %}
               </div>
               {% else %}
-              <p class="field-hint">Upload CSV first to choose custom columns.</p>
+              <p class="field-hint">Upload a participants CSV first to choose columns.</p>
               {% endif %}
             </div>
+          </div>
 
-            <p class="field-hint">Name text position &amp; style on the certificate:</p>
-            
-            <!-- Certificate Preview Layout with Canvas -->
+          <!-- Layout -->
+          <div class="admin-form-section">
+            <h3>Name placement</h3>
+            <p class="admin-subtitle">Where the participant's name is drawn on the template.</p>
+
             <div class="cert-config-layout">
               <div class="cert-config-inputs">
                 <div class="input-pair">
                   <div>
-                    <label for="text_x">X position (px)</label>
+                    <label for="text_x">X position</label>
                     <input id="text_x" name="text_x" class="coord-input" type="number" min="0"
                       value="{{ event.text_x if event else 1789 }}" />
                   </div>
                   <div>
-                    <label for="text_y">Y position (px)</label>
+                    <label for="text_y">Y position</label>
                     <input id="text_y" name="text_y" class="coord-input" type="number" min="0"
                       value="{{ event.text_y if event else 1440 }}" />
                   </div>
                 </div>
+
+                {% set selected_font_key = event.font_key if event and event.font_key else default_font_key %}
                 <div class="input-pair">
-                  {% set selected_font_key = event.font_key if event and event.font_key else default_font_key %}
                   <div>
-                    <label for="font_size">Font size (px)</label>
+                    <label for="font_size">Font size</label>
                     <input id="font_size" name="font_size" class="coord-input" type="number" min="8"
                       value="{{ event.font_size if event else 100 }}" />
                   </div>
                   <div>
-                    <label for="font_key">Font family</label>
+                    <label for="font_key">Typeface</label>
                     <select id="font_key" name="font_key" class="coord-input">
                       {% for option in font_options %}
                       <option
@@ -172,9 +194,10 @@
                     </select>
                   </div>
                 </div>
+
                 <div class="input-pair">
                   <div>
-                    <label for="font_color">Font color</label>
+                    <label for="font_color">Colour</label>
                     {% if event and event.font_color %}
                       {% set fc = event.font_color %}
                       <input id="font_color" name="font_color" type="color"
@@ -183,99 +206,97 @@
                       <input id="font_color" name="font_color" type="color" value="#321812" />
                     {% endif %}
                   </div>
+                  {% if not is_new and has_template %}
+                  <div>
+                    <label for="preview_sample_text">Preview text</label>
+                    <input id="preview_sample_text" class="coord-input" type="text"
+                      value="Sample Text" placeholder="Sample Text" maxlength="80" />
+                  </div>
+                  {% endif %}
                 </div>
-                {% if not is_new and has_template %}
-                <div>
-                  <label for="preview_sample_text">Preview sample text</label>
-                  <input
-                    id="preview_sample_text"
-                    class="coord-input"
-                    type="text"
-                    value="Sample Text"
-                    placeholder="Type sample text for mini preview"
-                    maxlength="80"
-                  />
-                </div>
-                {% endif %}
               </div>
             </div>
 
             {% if not is_new %}
-            {% if has_template %}
-            <div class="cert-preview-area" id="certPreviewContainer">
-              <div
-                class="cert-preview-media"
-                id="certPreviewMedia"
-                data-template-url="{{ url_for('admin_template_preview', slug=event.slug) }}"
-              >
-                <div class="cert-preview-loading is-visible" id="certPreviewLoading" role="status" aria-live="polite">
-                  Loading template preview...
+              {% if has_template %}
+              <div class="cert-preview-area" id="certPreviewContainer">
+                <div
+                  class="cert-preview-media"
+                  id="certPreviewMedia"
+                  data-template-url="{{ url_for('admin_template_preview', slug=event.slug) }}"
+                >
+                  <div class="cert-preview-loading is-visible" id="certPreviewLoading"
+                       role="status" aria-live="polite">Loading preview</div>
+                  <canvas id="certPreviewBaseCanvas" class="cert-preview-canvas cert-preview-base"
+                          aria-label="Certificate template preview"></canvas>
+                  <canvas id="certPreviewTextCanvas" class="cert-preview-canvas cert-preview-overlay"
+                          aria-hidden="true"></canvas>
                 </div>
-                <canvas
-                  id="certPreviewBaseCanvas"
-                  class="cert-preview-canvas cert-preview-base"
-                  aria-label="Certificate template preview"
-                ></canvas>
-                <canvas
-                  id="certPreviewTextCanvas"
-                  class="cert-preview-canvas cert-preview-overlay"
-                  aria-label="Certificate template preview"
-                ></canvas>
               </div>
-            </div>
-            {% else %}
-            <p class="field-hint cert-preview-empty">Upload a certificate template to see the live preview here.</p>
+              <a href="{{ url_for('admin_coordinate_editor', slug=event.slug) }}"
+                 class="button-link secondary" style="width: 100%; margin-top: 0.9rem;">
+                Open full-screen editor
+              </a>
+              {% else %}
+              <p class="field-hint cert-preview-empty">
+                Upload a template below to see a live preview here.
+              </p>
+              {% endif %}
             {% endif %}
-            <a href="{{ url_for('admin_coordinate_editor', slug=event.slug) }}" class="button-link" style="width: 100%; text-align: center; margin-top: 0.75rem;">
-              Live Preview Editor
-            </a>
-            {% endif %}
+          </div>
 
-            <button type="submit">{{ 'Create Event' if is_new else 'Save Settings' }}</button>
-          </form>
-        </div>
+          <button type="submit">{{ 'Create event' if is_new else 'Save settings' }}</button>
+        </form>
 
         {% if not is_new %}
 
-        <!-- ── Certificate Template ── -->
+        <!-- Template -->
         <div class="admin-form-section">
-          <h3>Certificate Template</h3>
+          <h3>Certificate template</h3>
           {% if has_template %}
-          <p class="field-hint success-text">✓ Template is uploaded.</p>
+          <p class="admin-subtitle success-text">Template uploaded.</p>
           {% else %}
-          <p class="field-hint warn-text">⚠ No template uploaded yet — the event cannot go live without one.</p>
+          <p class="admin-subtitle warn-text">No template yet &mdash; the event cannot go live without one.</p>
           {% endif %}
+
           <form
             action="{{ url_for('admin_upload_template', slug=event.slug) }}"
             method="post"
             enctype="multipart/form-data"
-            class="form admin-form"
+            class="admin-form form"
           >
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <label for="template_file">{{ 'Replace template' if has_template else 'Upload template' }} (PNG, JPG, GIF, WebP)</label>
-            <input id="template_file" name="template_file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,image/png,image/jpeg,image/gif,image/webp" required />
-            <p class="field-hint">The participant's name will be printed at the X/Y coordinates configured above.</p>
-            <button type="submit">{{ 'Replace Template' if has_template else 'Upload Template' }}</button>
+            <label for="template_file">{{ 'Replace file' if has_template else 'Upload file' }}</label>
+            <input id="template_file" name="template_file" type="file"
+                   accept=".png,.jpg,.jpeg,.gif,.webp,image/png,image/jpeg,image/gif,image/webp" required />
+            <p class="field-hint">PNG, JPG, GIF or WebP. Up to 40 megapixels.</p>
+            <button type="submit">{{ 'Replace template' if has_template else 'Upload template' }}</button>
           </form>
         </div>
 
-        <!-- ── Participants CSV ── -->
+        <!-- Participants -->
         <div class="admin-form-section">
-          <h3>Participants CSV</h3>
+          <h3>Participants</h3>
           {% if has_csv %}
-          <p class="field-hint success-text">✓ Participants CSV is uploaded.</p>
+          <p class="admin-subtitle success-text">Participant list uploaded.</p>
           {% else %}
-          <p class="field-hint warn-text">⚠ No CSV uploaded yet — certificate requests will fail validation.</p>
+          <p class="admin-subtitle warn-text">No participant list yet &mdash; every request will fail validation.</p>
           {% endif %}
+
           <form
             action="{{ url_for('admin_upload_csv', slug=event.slug) }}"
             method="post"
             enctype="multipart/form-data"
-            class="form admin-form"
+            class="admin-form form"
           >
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <label for="csv_file">{{ 'Replace CSV' if has_csv else 'Upload CSV' }}</label>
-            <input id="csv_file" name="csv_file" type="file" accept=".csv,text/csv" required />
+            <label for="csv_file">{{ 'Replace list' if has_csv else 'Upload list' }}</label>
+            <input id="csv_file" name="csv_file" type="file"
+                   accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                   required />
+            <p class="field-hint">
+              CSV or Excel (.xlsx). A workbook is read from its first sheet.
+            </p>
             <p class="field-hint">
               {% if event.validation_type == 'player_team' %}
               Required columns: <code>player</code>, <code>team</code>
@@ -284,34 +305,34 @@
               {% elif event.validation_type == 'email' %}
               Required column: <code>email</code>
               {% elif event.validation_type == 'badge_id' %}
-              Required one of: <code>roll_no</code>, <code>id</code>, <code>badge_id</code>, <code>badge_number</code>
+              Required: one of <code>roll_no</code>, <code>id</code>, <code>badge_id</code>, <code>badge_number</code>
               {% elif event.validation_type == 'custom' %}
-              Required: all selected custom fields above
+              Required: every column selected above
               {% elif event.validation_type == 'none' %}
-              CSV is optional for this mode
+              Optional for this validation mode
               {% else %}
               Required column: <code>name</code>
               {% endif %}
             </p>
-            <button type="submit">{{ 'Replace CSV' if has_csv else 'Upload CSV' }}</button>
+            <button type="submit">{{ 'Replace list' if has_csv else 'Upload list' }}</button>
           </form>
         </div>
 
-        <!-- ── Visibility / Activate ── -->
+        <!-- Visibility -->
         <div class="admin-form-section">
           <h3>Visibility</h3>
-          <p class="field-hint">
+          <p class="admin-subtitle">
             Public URL:
-            <a href="{{ url_for('event_page', slug=event.slug) }}" target="_blank">
-              /events/{{ event.slug }}
-            </a>
+            <a href="{{ url_for('event_page', slug=event.slug) }}" target="_blank"
+               rel="noopener" class="admin-table-link">/events/{{ event.slug }}</a>
           </p>
-          <form action="{{ url_for('admin_toggle_event', slug=event.slug) }}" method="post">
+          <form action="{{ url_for('admin_toggle_event', slug=event.slug) }}" method="post"
+                class="admin-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             {% if event.active %}
-            <button type="submit" class="button-link danger">Deactivate Event</button>
+            <button type="submit" class="danger">Deactivate event</button>
             {% else %}
-            <button type="submit" class="button-link">Activate Event</button>
+            <button type="submit">Activate event</button>
             {% endif %}
           </form>
         </div>
@@ -322,7 +343,7 @@
 
     {% if is_new %}
     <script>
-      // Auto-generate slug from name while user types
+      // Suggest a slug from the name until the user edits the slug themselves.
       const nameEl = document.getElementById('name');
       const slugEl = document.getElementById('slug');
       let userEditedSlug = false;
@@ -336,27 +357,28 @@
       });
 
       const customPanel = document.getElementById('customFieldsPanel');
-      const validationInputs = document.querySelectorAll('input[name="validation_type"]');
       function toggleCustomPanel() {
         const selected = document.querySelector('input[name="validation_type"]:checked');
         if (!customPanel || !selected) return;
         customPanel.classList.toggle('is-visible', selected.value === 'custom');
       }
-      validationInputs.forEach((input) => input.addEventListener('change', toggleCustomPanel));
+      document.querySelectorAll('input[name="validation_type"]')
+        .forEach((input) => input.addEventListener('change', toggleCustomPanel));
       toggleCustomPanel();
     </script>
     {% else %}
     <script>
       const customPanelEdit = document.getElementById('customFieldsPanel');
-      const validationInputsEdit = document.querySelectorAll('input[name="validation_type"]');
       const editConfigForm = document.querySelector('form[action$="/config"]');
       const editConfigStatus = document.getElementById('configSaveStatus');
+
       function toggleCustomPanelEdit() {
         const selected = document.querySelector('input[name="validation_type"]:checked');
         if (!customPanelEdit || !selected) return;
         customPanelEdit.classList.toggle('is-visible', selected.value === 'custom');
       }
-      validationInputsEdit.forEach((input) => input.addEventListener('change', toggleCustomPanelEdit));
+      document.querySelectorAll('input[name="validation_type"]')
+        .forEach((input) => input.addEventListener('change', toggleCustomPanelEdit));
       toggleCustomPanelEdit();
 
       const previewMedia = document.getElementById('certPreviewMedia');
@@ -371,6 +393,7 @@
       const fontKeyInput = document.getElementById('font_key');
       const fontColorInput = document.getElementById('font_color');
       const previewSampleInput = document.getElementById('preview_sample_text');
+
       let previewRaf = null;
       let editAutosaveTimer = null;
       let editAutosaveInFlight = false;
@@ -382,28 +405,26 @@
       const loadedPreviewFonts = new Set();
 
       function selectedPreviewFont() {
-        const selectedOption = fontKeyInput && fontKeyInput.selectedOptions
+        const selected = fontKeyInput && fontKeyInput.selectedOptions
           ? fontKeyInput.selectedOptions[0]
           : null;
         return {
-          family: (selectedOption && selectedOption.dataset.family) || 'Montserrat Bold',
-          weight: (selectedOption && selectedOption.dataset.weight) || '700',
-          url: (selectedOption && selectedOption.dataset.url) || ''
+          family: (selected && selected.dataset.family) || 'Montserrat Bold',
+          weight: (selected && selected.dataset.weight) || '700',
+          url: (selected && selected.dataset.url) || ''
         };
       }
 
       function ensurePreviewFontLoaded() {
         const font = selectedPreviewFont();
-        if (!document.fonts) {
-          return Promise.resolve();
-        }
+        if (!document.fonts) return Promise.resolve();
         if (loadedPreviewFonts.has(font.family)) {
           return document.fonts.load(`${font.weight} 32px "${font.family}"`).catch(() => undefined);
         }
         if (window.FontFace && font.url) {
           const face = new FontFace(font.family, `url(${font.url})`, { weight: font.weight });
-          return face.load().then((loadedFace) => {
-            document.fonts.add(loadedFace);
+          return face.load().then((loaded) => {
+            document.fonts.add(loaded);
             loadedPreviewFonts.add(font.family);
             return document.fonts.load(`${font.weight} 32px "${font.family}"`);
           }).catch(() => undefined);
@@ -424,44 +445,31 @@
           editAutosaveQueued = true;
           return;
         }
-
         editAutosaveInFlight = true;
         editAutosaveQueued = false;
-        setEditSaveStatus('Saving changes...', false);
+        setEditSaveStatus('Saving...', false);
 
         fetch(editConfigForm.action, {
           method: 'POST',
           body: new FormData(editConfigForm),
-          headers: {
-            'X-Requested-With': 'XMLHttpRequest'
-          }
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
         })
           .then(async (response) => {
-            if (!response.ok) {
-              throw new Error('Save failed');
-            }
+            if (!response.ok) throw new Error('Save failed');
             return response.json();
           })
-          .then(() => {
-            setEditSaveStatus('Settings saved automatically.', false);
-          })
-          .catch(() => {
-            setEditSaveStatus('Autosave failed. Use Save Settings to retry.', true);
-          })
+          .then(() => setEditSaveStatus('Saved.', false))
+          .catch(() => setEditSaveStatus('Autosave failed. Use Save settings to retry.', true))
           .finally(() => {
             editAutosaveInFlight = false;
-            if (editAutosaveQueued) {
-              runEditAutosave();
-            }
+            if (editAutosaveQueued) runEditAutosave();
           });
       }
 
       function scheduleEditAutosave() {
         if (!editConfigForm) return;
-        if (editAutosaveTimer) {
-          clearTimeout(editAutosaveTimer);
-        }
-        setEditSaveStatus('Unsaved changes...', false);
+        if (editAutosaveTimer) clearTimeout(editAutosaveTimer);
+        setEditSaveStatus('Unsaved changes', false);
         editAutosaveTimer = setTimeout(runEditAutosave, 500);
       }
 
@@ -469,10 +477,12 @@
         if (!previewMedia || !previewTemplateImage || !previewBaseCanvas || !previewTextCanvas) {
           return false;
         }
-
-        const availableWidth = previewMedia.clientWidth || previewTemplateImage.width;
-        const drawWidth = Math.max(1, Math.round(Math.min(availableWidth, PREVIEW_MAX_WIDTH)));
-        const drawHeight = Math.max(1, Math.round(drawWidth * (previewTemplateImage.height / previewTemplateImage.width)));
+        const available = previewMedia.clientWidth || previewTemplateImage.width;
+        const drawWidth = Math.max(1, Math.round(Math.min(available - 20, PREVIEW_MAX_WIDTH)));
+        const drawHeight = Math.max(
+          1,
+          Math.round(drawWidth * (previewTemplateImage.height / previewTemplateImage.width))
+        );
 
         if (previewBaseCanvas.width !== drawWidth || previewBaseCanvas.height !== drawHeight) {
           previewBaseCanvas.width = drawWidth;
@@ -489,30 +499,24 @@
       }
 
       function drawSmallPreviewBackground() {
-        if (!previewBaseCanvas || !previewBaseCtx || !previewTemplateImage) {
-          return;
-        }
-        if (!syncPreviewCanvasSize()) {
-          return;
-        }
+        if (!previewBaseCtx || !previewTemplateImage || !syncPreviewCanvasSize()) return;
         previewBaseCtx.clearRect(0, 0, previewBaseCanvas.width, previewBaseCanvas.height);
-        previewBaseCtx.drawImage(previewTemplateImage, 0, 0, previewBaseCanvas.width, previewBaseCanvas.height);
+        previewBaseCtx.drawImage(
+          previewTemplateImage, 0, 0, previewBaseCanvas.width, previewBaseCanvas.height
+        );
       }
 
       function drawSmallPreviewText() {
-        if (!previewTextCanvas || !previewTextCtx || !previewMedia || !previewTemplateImage || !textXInput || !textYInput || !fontSizeInput || !fontColorInput) {
+        if (!previewTextCtx || !previewTemplateImage || !textXInput || !textYInput
+            || !fontSizeInput || !fontColorInput || !syncPreviewCanvasSize()) {
           return;
         }
-        if (!syncPreviewCanvasSize()) {
-          return;
-        }
-
         previewTextCtx.clearRect(0, 0, previewTextCanvas.width, previewTextCanvas.height);
 
         const displayText = (previewSampleInput && previewSampleInput.value.trim()) || 'Sample Text';
         const textX = (parseInt(textXInput.value, 10) || 0) * previewScaleX;
         const textY = (parseInt(textYInput.value, 10) || 0) * previewScaleY;
-        const fontSize = Math.max(12, (parseInt(fontSizeInput.value, 10) || 100) * previewScaleX);
+        const fontSize = Math.max(8, (parseInt(fontSizeInput.value, 10) || 100) * previewScaleX);
         const font = selectedPreviewFont();
 
         previewTextCtx.fillStyle = fontColorInput.value || '#321812';
@@ -523,12 +527,11 @@
       }
 
       function loadSmallPreviewTemplate() {
-        if (!previewMedia || !previewBaseCanvas || !previewTextCanvas || !previewBaseCtx || !previewTextCtx || !previewMedia.dataset.templateUrl) {
+        if (!previewMedia || !previewBaseCtx || !previewTextCtx || !previewMedia.dataset.templateUrl) {
           return;
         }
-
         if (previewLoadingEl) {
-          previewLoadingEl.textContent = 'Loading template preview...';
+          previewLoadingEl.textContent = 'Loading preview';
           previewLoadingEl.classList.remove('has-error');
           previewLoadingEl.classList.add('is-visible');
         }
@@ -537,34 +540,21 @@
         image.onload = () => {
           previewTemplateImage = image;
           drawSmallPreviewBackground();
-          if (previewLoadingEl) {
-            previewLoadingEl.classList.remove('is-visible');
-          }
+          if (previewLoadingEl) previewLoadingEl.classList.remove('is-visible');
           ensurePreviewFontLoaded().finally(drawSmallPreviewText);
         };
         image.onerror = () => {
           previewTemplateImage = null;
-          previewBaseCtx.clearRect(0, 0, previewBaseCanvas.width, previewBaseCanvas.height);
-          previewTextCtx.clearRect(0, 0, previewTextCanvas.width, previewTextCanvas.height);
-          const fallbackFont = selectedPreviewFont();
-          previewBaseCtx.fillStyle = '#93a4c3';
-          previewBaseCtx.font = `${fallbackFont.weight} 20px "${fallbackFont.family}", Arial`;
-          previewBaseCtx.textAlign = 'center';
-          previewBaseCtx.textBaseline = 'middle';
-          previewBaseCtx.fillText('Preview not available', previewBaseCanvas.width / 2, previewBaseCanvas.height / 2);
           if (previewLoadingEl) {
-            previewLoadingEl.textContent = 'Could not load preview';
-            previewLoadingEl.classList.add('has-error');
-            previewLoadingEl.classList.add('is-visible');
+            previewLoadingEl.textContent = 'Preview unavailable';
+            previewLoadingEl.classList.add('has-error', 'is-visible');
           }
         };
         image.src = `${previewMedia.dataset.templateUrl}?t=${Date.now()}`;
       }
 
       function scheduleSmallPreviewUpdate() {
-        if (previewRaf) {
-          cancelAnimationFrame(previewRaf);
-        }
+        if (previewRaf) cancelAnimationFrame(previewRaf);
         previewRaf = requestAnimationFrame(() => {
           drawSmallPreviewText();
           previewRaf = null;
@@ -576,23 +566,25 @@
         drawSmallPreviewText();
       }
 
-      [textXInput, textYInput, fontSizeInput, fontKeyInput, fontColorInput, previewSampleInput].forEach((el) => {
-        if (el) {
+      [textXInput, textYInput, fontSizeInput, fontKeyInput, fontColorInput, previewSampleInput]
+        .forEach((el) => {
+          if (!el) return;
           const eventName = el.tagName === 'SELECT' ? 'change' : 'input';
           el.addEventListener(eventName, () => {
             ensurePreviewFontLoaded().finally(scheduleSmallPreviewUpdate);
           });
-        }
-      });
+        });
 
       if (editConfigForm) {
-        editConfigForm.querySelectorAll('input[name], select[name], textarea[name]').forEach((input) => {
-          if (input.type === 'file') return;
-          const eventName = input.type === 'checkbox' || input.type === 'radio' || input.type === 'color'
-            ? 'change'
-            : 'input';
-          input.addEventListener(eventName, scheduleEditAutosave);
-        });
+        editConfigForm.querySelectorAll('input[name], select[name], textarea[name]')
+          .forEach((input) => {
+            if (input.type === 'file' || input.type === 'hidden') return;
+            const eventName =
+              input.type === 'checkbox' || input.type === 'radio' || input.type === 'color'
+                ? 'change'
+                : 'input';
+            input.addEventListener(eventName, scheduleEditAutosave);
+          });
       }
 
       if (previewMedia && previewBaseCanvas && previewTextCanvas) {
