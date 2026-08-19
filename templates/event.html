@@ -17,6 +17,7 @@
         {% endif %}
 
         <form action="{{ url_for('download_certificate', slug=event.slug) }}" method="post" class="form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
           {% if event.validation_type in ['player_team', 'name_only', 'email', 'badge_id'] %}
           <label for="registration_name">{{ validation_prompt }}</label>
           <input

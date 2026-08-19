@@ -14,6 +14,7 @@
           <a href="{{ url_for('admin_logs') }}" class="admin-nav-link">View Logs</a>
           <a href="{{ url_for('home') }}" class="admin-nav-link">View Site</a>
           <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <button class="admin-nav-btn" type="submit">Log Out</button>
           </form>
         </div>
@@ -46,7 +47,7 @@
                     /events/{{ event.slug }}
                   </a>
                 </td>
-                <td>{{ 'Player + Team' if event.validation_type == 'player_team' else 'Name Only' }}</td>
+                <td>{{ validation_type_labels.get(event.validation_type, event.validation_type) }}</td>
                 <td>
                   <span class="status-badge {{ 'active' if event.active else 'inactive' }}">
                     {{ 'Active' if event.active else 'Inactive' }}
@@ -55,6 +56,7 @@
                 <td class="admin-actions-cell">
                   <a href="{{ url_for('admin_edit_event', slug=event.slug) }}" class="admin-action-link">Edit</a>
                   <form action="{{ url_for('admin_toggle_event', slug=event.slug) }}" method="post" style="display:inline">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                     <button class="admin-action-btn" type="submit">
                       {{ 'Deactivate' if event.active else 'Activate' }}
                     </button>
@@ -68,6 +70,7 @@
                 <td colspan="5">
                   <form action="{{ url_for('admin_delete_event', slug=event.slug) }}" method="post"
                     class="delete-confirm-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                     <span class="delete-confirm-label">
                       Type <strong>{{ event.slug }}</strong> to confirm permanent deletion:
                     </span>

@@ -3,8 +3,30 @@ services:
     name: certificate-generator
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --worker-class gthread --timeout 120 --access-logfile - --slow-requests 5
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --worker-class gthread --timeout 120 --access-logfile -
     plan: free
+    healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Signs admin sessions and certificate links, so it must stay identical
+      # across workers and restarts. Render generates it once and stores it.
+      - key: SECRET_KEY
+        generateValue: true
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      # Secrets: set these in the Render dashboard, never in this file.
+      - key: ADMIN_PASSWORD
+        sync: false
+      # Supabase Storage holds the certificate templates.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: certificate-templates
+      # Upstash KV holds event configs and participant CSVs.
+      - key: KV_REST_API_URL
+        sync: false
+      - key: KV_REST_API_TOKEN
+        sync: false

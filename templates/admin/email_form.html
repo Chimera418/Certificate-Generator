@@ -67,6 +67,7 @@
       <div class="coord-editor-panel">
         
         <form id="editorForm" method="post" action="{{ url_for('admin_send_emails', slug=event.slug) }}" onsubmit="return confirm('Start background job to generate and send emails with these settings?');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
           
           <h3>Email Configuration</h3>
           

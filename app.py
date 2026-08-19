@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import time
+from collections import OrderedDict
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -18,13 +22,28 @@ from uuid import uuid4
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from PIL import Image, ImageDraw, ImageFont
 from werkzeug.utils import secure_filename
+from itsdangerous import BadSignature, URLSafeSerializer
 from dotenv import load_dotenv
 import yaml
 
 load_dotenv()
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
+
+# Certificate links are signed with this key, so an unstable key does not just log
+# admins out at random - it invalidates every outstanding certificate link too.
+_SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+if not _SECRET_KEY:
+	_SECRET_KEY = os.urandom(24).hex()
+	print(
+		"WARNING: SECRET_KEY is not set. A random key was generated for this process, "
+		"so sessions and certificate links will break across restarts and will not "
+		"work at all with more than one worker. Set SECRET_KEY in the environment."
+	)
+app.secret_key = _SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_EVENTS_DIR = os.path.join(BASE_DIR, "events")
@@ -46,6 +65,10 @@ def _resolve_runtime_writable_dir() -> str:
 RUNTIME_WRITABLE_DIR = _resolve_runtime_writable_dir()
 EVENTS_DIR = os.path.join(RUNTIME_WRITABLE_DIR, "events")
 GENERATED_DIR = os.path.join(RUNTIME_WRITABLE_DIR, "generated_certificates")
+# Background jobs log here. It lives on the writable runtime dir because the code
+# directory is read-only on some hosts.
+LOG_DIR = os.path.join(RUNTIME_WRITABLE_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "system.log")
 FONT_PATH = os.path.join(BASE_DIR, "fonts", "Montserrat-Bold.ttf")
 DEFAULT_FONT_KEY = "montserrat_bold"
 FONT_OPTIONS = {
@@ -68,26 +91,90 @@ _EVENT_STATE_CACHE: dict[str, dict] | None = None
 _EVENT_STATE_CACHE_AT = 0.0
 _EVENT_STATE_CACHE_TTL_SEC = 2.0
 
+# Supabase Storage holds certificate templates so they survive redeploys and are
+# visible to every worker. Local files stay as the dev / no-Supabase fallback.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "certificate-templates").strip()
+_SUPABASE_BUCKET_READY = False
+
+
+def _env_int(name: str, fallback: int) -> int:
+	try:
+		return max(1, int(os.environ.get(name, "").strip()))
+	except (TypeError, ValueError):
+		return fallback
+
+
 # Event config cache (per-slug) to avoid repeated KV API calls during preview/download
 _EVENT_CONFIG_CACHE: dict[str, tuple[dict, float]] = {}  # {slug: (config, timestamp)}
 _EVENT_CONFIG_CACHE_TTL_SEC = 30.0  # 30 second TTL for event configs
 
-# Rendered certificate image cache (in-memory) to avoid reprocessing
-_RENDERED_CERT_CACHE: dict[str, tuple[bytes, str]] = {}  # {cert_id: (png_bytes, etag)}
-_RENDERED_CERT_CACHE_MAX_SIZE = 50  # Keep cache size reasonable
+# Participant CSVs are read several times per page (team list, each dropdown column,
+# then again during validation). Without this, each of those was a separate KV
+# round trip. Strings are immutable, so the cached value can be shared freely.
+_EVENT_CSV_CACHE: dict[str, tuple[str | None, float]] = {}  # {slug: (csv_text, timestamp)}
+_EVENT_CSV_CACHE_TTL_SEC = 30.0
 
-# Font cache (in-memory) to avoid disk I/O on every render
-_FONT_CACHE: dict[str, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}  # {size:font_key -> font}
+# A decoded template is tens of megabytes (an A4 300 DPI page is 8.7 MP), so these
+# caches stay small. Templates are held as RGB unless they really carry alpha,
+# which is 25% less memory than RGBA and buys a couple more cache slots.
+_TEMPLATE_CACHE_MAX = _env_int("TEMPLATE_CACHE_MAX", 6)
+_RENDER_CACHE_MAX = _env_int("RENDER_CACHE_MAX", 6)
+_FONT_CACHE_MAX = 20
 
-# Template image cache (in-memory) to avoid repeated open/convert operations
-_TEMPLATE_IMAGE_CACHE: dict[str, Image.Image] = {}  # {event_slug -> RGBA Image}
+# Encoding dominates render time: for an 8.7 MP page, drawing the name takes ~4 ms
+# while the PNG encode takes ~320 ms at Pillow's default compression. So the screen
+# preview is downscaled and sent as JPEG, and the download drops to a lighter PNG
+# compression level - which, with the alpha channel gone, is still a smaller file.
+PREVIEW_MAX_WIDTH = _env_int("PREVIEW_MAX_WIDTH", 1200)
+PREVIEW_JPEG_QUALITY = _env_int("PREVIEW_JPEG_QUALITY", 90)
+DOWNLOAD_PNG_COMPRESS_LEVEL = _env_int("DOWNLOAD_PNG_COMPRESS_LEVEL", 3)
+
+# Every cache key embeds the template version and render settings, so a replaced
+# template or an edited coordinate produces a new key instead of a stale hit.
+_TEMPLATE_IMAGE_CACHE: "OrderedDict[str, Image.Image]" = OrderedDict()
+_RENDERED_CERT_CACHE: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+_FONT_CACHE: "OrderedDict[str, ImageFont.FreeTypeFont | ImageFont.ImageFont]" = OrderedDict()
+
+
+def _cache_get(cache: OrderedDict, key: str):
+	if key not in cache:
+		return None
+	cache.move_to_end(key)
+	return cache[key]
+
+
+def _cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
+	cache[key] = value
+	cache.move_to_end(key)
+	while len(cache) > max_size:
+		cache.popitem(last=False)
 
 os.makedirs(EVENTS_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+TEMPLATE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+TEMPLATE_CONTENT_TYPES = {
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif": "image/gif",
+	".webp": "image/webp",
+}
+# Guards against decompression bombs: a 40 MP RGBA image is already ~160 MB decoded.
+MAX_TEMPLATE_PIXELS = 40_000_000
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 VALIDATION_TYPES = {"player_team", "name_only", "email", "badge_id", "custom", "none"}
+VALIDATION_TYPE_LABELS = {
+	"player_team": "Player + Team",
+	"name_only": "Name Only",
+	"email": "Email",
+	"badge_id": "Roll No",
+	"custom": "Custom Fields",
+	"none": "No Validation",
+}
 
 
 def _kv_enabled() -> bool:
@@ -167,6 +254,95 @@ def _kv_delete_key(key: str) -> None:
 	req = urlrequest.Request(url, method="POST", headers={"Authorization": f"Bearer {KV_REST_API_TOKEN}"})
 	with urlrequest.urlopen(req, timeout=5):
 		return
+
+
+# ─── Supabase Storage ─────────────────────────────────────────────────────────
+
+def _supabase_enabled() -> bool:
+	return bool(
+		SUPABASE_URL
+		and SUPABASE_SERVICE_KEY
+		and SUPABASE_URL.lower().startswith(("http://", "https://"))
+	)
+
+
+def _supabase_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+	headers = {
+		"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+		"apikey": SUPABASE_SERVICE_KEY,
+	}
+	if extra:
+		headers.update(extra)
+	return headers
+
+
+def _supabase_object_url(object_path: str) -> str:
+	bucket = urlparse.quote(SUPABASE_BUCKET, safe="")
+	encoded_path = urlparse.quote(object_path, safe="/")
+	return f"{SUPABASE_URL}/storage/v1/object/{bucket}/{encoded_path}"
+
+
+def _supabase_ensure_bucket() -> None:
+	"""Create the private storage bucket on first use. Safe to call repeatedly."""
+	global _SUPABASE_BUCKET_READY
+	if _SUPABASE_BUCKET_READY:
+		return
+	payload = json.dumps({"id": SUPABASE_BUCKET, "name": SUPABASE_BUCKET, "public": False}).encode("utf-8")
+	req = urlrequest.Request(
+		f"{SUPABASE_URL}/storage/v1/bucket",
+		data=payload,
+		method="POST",
+		headers=_supabase_headers({"Content-Type": "application/json"}),
+	)
+	try:
+		with urlrequest.urlopen(req, timeout=10):
+			pass
+	except urlerror.HTTPError as exc:
+		# 400/409 is the steady state: the bucket already exists.
+		if exc.code not in (400, 409):
+			raise
+	_SUPABASE_BUCKET_READY = True
+
+
+def _supabase_ping() -> None:
+	"""Round-trip to Supabase so a keep-alive cron also keeps the project awake."""
+	bucket = urlparse.quote(SUPABASE_BUCKET, safe="")
+	req = urlrequest.Request(f"{SUPABASE_URL}/storage/v1/bucket/{bucket}", headers=_supabase_headers())
+	with urlrequest.urlopen(req, timeout=10):
+		return
+
+
+def _supabase_upload(object_path: str, data: bytes, content_type: str) -> None:
+	_supabase_ensure_bucket()
+	req = urlrequest.Request(
+		_supabase_object_url(object_path),
+		data=data,
+		method="POST",
+		headers=_supabase_headers({"Content-Type": content_type, "x-upsert": "true"}),
+	)
+	with urlrequest.urlopen(req, timeout=30):
+		return
+
+
+def _supabase_download(object_path: str) -> bytes | None:
+	req = urlrequest.Request(_supabase_object_url(object_path), headers=_supabase_headers())
+	try:
+		with urlrequest.urlopen(req, timeout=20) as response:
+			return response.read()
+	except urlerror.HTTPError as exc:
+		if exc.code == 404:
+			return None
+		raise
+
+
+def _supabase_delete(object_path: str) -> None:
+	req = urlrequest.Request(_supabase_object_url(object_path), method="DELETE", headers=_supabase_headers())
+	try:
+		with urlrequest.urlopen(req, timeout=15):
+			return
+	except urlerror.HTTPError as exc:
+		if exc.code != 404:
+			raise
 
 
 def _load_event_states(force: bool = False) -> dict[str, dict]:
@@ -287,9 +463,9 @@ def _event_config_key(slug: str) -> str:
 
 
 def _event_template_path(slug: str) -> str:
-	"""Get template path. Returns first matching image file in event directory."""
+	"""Local template path. Returns the first matching image file in the event directory."""
 	event_dir = _event_dir(slug)
-	for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
+	for ext in TEMPLATE_EXTENSIONS:
 		path = os.path.join(event_dir, f"template{ext}")
 		if os.path.exists(path):
 			return path
@@ -302,6 +478,125 @@ def _event_csv_path(slug: str) -> str:
 
 def _event_csv_key(slug: str) -> str:
 	return f"{KV_EVENT_CSV_PREFIX}{slug}"
+
+
+# ─── Certificate template storage ─────────────────────────────────────────────
+
+def _template_object_path(slug: str, ext: str) -> str:
+	return f"events/{slug}/template{ext}"
+
+
+def template_ext_for(slug: str, config: dict | None = None) -> str:
+	"""Extension recorded on the config, falling back to whatever is on local disk."""
+	recorded = (config or {}).get("template_ext")
+	if isinstance(recorded, str) and recorded.lower() in TEMPLATE_EXTENSIONS:
+		return recorded.lower()
+	for ext in TEMPLATE_EXTENSIONS:
+		if os.path.exists(os.path.join(_event_dir(slug), f"template{ext}")):
+			return ext
+	return ".png"
+
+
+def template_version_for(slug: str, config: dict | None = None) -> str:
+	"""Cache-busting token for a template. Changes whenever the template changes."""
+	version = (config or {}).get("template_version")
+	if isinstance(version, str) and version:
+		return version
+	# Events created before versioning fall back to the local file mtime.
+	try:
+		return str(int(os.path.getmtime(_event_template_path(slug))))
+	except OSError:
+		return "none"
+
+
+def has_template(slug: str, config: dict | None = None) -> bool:
+	if (config or {}).get("template_version"):
+		return True
+	return os.path.exists(_event_template_path(slug))
+
+
+def load_template_bytes(slug: str, config: dict | None = None) -> bytes | None:
+	ext = template_ext_for(slug, config)
+	if _supabase_enabled():
+		try:
+			data = _supabase_download(_template_object_path(slug, ext))
+			if data:
+				return data
+		except (urlerror.URLError, TimeoutError, OSError, ValueError):
+			pass
+	path = os.path.join(_event_dir(slug), f"template{ext}")
+	if not os.path.exists(path):
+		path = _event_template_path(slug)
+	try:
+		with open(path, "rb") as f:
+			return f.read()
+	except OSError:
+		return None
+
+
+def save_template_bytes(slug: str, data: bytes, ext: str) -> str:
+	"""Persist a template everywhere and return its new version token."""
+	if _supabase_enabled():
+		_supabase_upload(
+			_template_object_path(slug, ext),
+			data,
+			TEMPLATE_CONTENT_TYPES.get(ext, "application/octet-stream"),
+		)
+	# Keep a local copy too: it is the fallback when Supabase is not configured.
+	try:
+		os.makedirs(_event_dir(slug), exist_ok=True)
+		for stale_ext in TEMPLATE_EXTENSIONS:
+			if stale_ext == ext:
+				continue
+			stale_path = os.path.join(_event_dir(slug), f"template{stale_ext}")
+			if os.path.exists(stale_path):
+				os.remove(stale_path)
+		with open(os.path.join(_event_dir(slug), f"template{ext}"), "wb") as f:
+			f.write(data)
+	except OSError:
+		# A read-only filesystem is fine as long as Supabase accepted the upload.
+		if not _supabase_enabled():
+			raise
+	return hashlib.sha256(data).hexdigest()[:16]
+
+
+def delete_template_storage(slug: str) -> None:
+	if not _supabase_enabled():
+		return
+	for ext in TEMPLATE_EXTENSIONS:
+		try:
+			_supabase_delete(_template_object_path(slug, ext))
+		except (urlerror.URLError, TimeoutError, OSError, ValueError):
+			continue
+
+
+def decode_template(data: bytes) -> Image.Image:
+	"""
+	Decode a template, keeping alpha only when the file actually has it.
+
+	Certificate templates are almost always opaque. Forcing them to RGBA costs 25%
+	more memory to hold and 25% more bytes to compress on every single render.
+	"""
+	image = Image.open(BytesIO(data))
+	if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+		return image.convert("RGBA")
+	return image.convert("RGB")
+
+
+def get_template_image(slug: str, config: dict | None = None) -> Image.Image | None:
+	"""Decoded template, cached per (slug, template version). Returns a copy."""
+	cache_key = f"{slug}@{template_version_for(slug, config)}"
+	cached = _cache_get(_TEMPLATE_IMAGE_CACHE, cache_key)
+	if cached is None:
+		data = load_template_bytes(slug, config)
+		if data is None:
+			return None
+		try:
+			cached = decode_template(data)
+		except Exception:
+			return None
+		_cache_put(_TEMPLATE_IMAGE_CACHE, cache_key, cached, _TEMPLATE_CACHE_MAX)
+	return cached.copy()
 
 
 def available_font_options() -> list[dict[str, str]]:
@@ -377,13 +672,15 @@ def _write_event_config_to_file(slug: str, config: dict) -> None:
 def _load_event_config(slug: str) -> dict | None:
 	"""Load event config with caching to minimize KV API calls during preview/download."""
 	global _EVENT_CONFIG_CACHE
-	
+
 	# Check cache first within TTL
 	if slug in _EVENT_CONFIG_CACHE:
 		config, cached_at = _EVENT_CONFIG_CACHE[slug]
 		if (time.time() - cached_at) < _EVENT_CONFIG_CACHE_TTL_SEC:
-			return config
-	
+			# Copy: callers mutate what they get back, and the cache is shared
+			# between requests and between bulk-generation threads.
+			return copy.deepcopy(config)
+
 	# Cache miss or expired - reload from source
 	config = None
 	if _kv_enabled():
@@ -396,18 +693,18 @@ def _load_event_config(slug: str) -> dict | None:
 					_ensure_event_slug_registered(slug)
 		except (urlerror.URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
 			pass
-	
+
 	# Fallback to file if KV missed or on error
 	if config is None:
 		config = _read_event_config_from_file(slug)
-	
+
 	# Cache the result (even if None) to avoid hammering KV on missing configs
-	_EVENT_CONFIG_CACHE[slug] = (config, time.time())
-	
+	_EVENT_CONFIG_CACHE[slug] = (copy.deepcopy(config), time.time())
+
 	# Limit cache size to prevent memory bloat
 	if len(_EVENT_CONFIG_CACHE) > 100:
 		_EVENT_CONFIG_CACHE.clear()
-	
+
 	return config
 
 
@@ -423,14 +720,26 @@ def _read_event_csv_from_file(slug: str) -> str | None:
 
 
 def load_event_csv_text(slug: str) -> str | None:
+	"""Participant CSV text, cached briefly because one page view reads it repeatedly."""
+	cached = _EVENT_CSV_CACHE.get(slug)
+	if cached is not None and (time.time() - cached[1]) < _EVENT_CSV_CACHE_TTL_SEC:
+		return cached[0]
+
+	content: str | None = None
 	if _kv_enabled():
 		try:
 			raw = _kv_get_raw(_event_csv_key(slug))
 			if isinstance(raw, str):
-				return raw
+				content = raw
 		except (urlerror.URLError, TimeoutError, OSError, ValueError):
 			pass
-	return _read_event_csv_from_file(slug)
+	if content is None:
+		content = _read_event_csv_from_file(slug)
+
+	_EVENT_CSV_CACHE[slug] = (content, time.time())
+	if len(_EVENT_CSV_CACHE) > 100:
+		_EVENT_CSV_CACHE.clear()
+	return content
 
 
 def _write_event_csv_to_file(slug: str, content: str) -> None:
@@ -534,20 +843,20 @@ def _apply_profile_overrides(config: dict) -> None:
 	mode = config.get("mode") or config.get("profile")
 	if not mode:
 		return
-	
+
 	profiles_path = os.path.join(BASE_DIR, "profiles.yaml")
 	if not os.path.exists(profiles_path):
 		return
-	
+
 	try:
 		with open(profiles_path, "r", encoding="utf-8") as f:
 			profiles_data = yaml.safe_load(f)
 			if not isinstance(profiles_data, dict):
 				return
-			
+
 			profiles = profiles_data.get("profiles", {})
 			profile_config = profiles.get(mode)
-			
+
 			if isinstance(profile_config, dict):
 				# Inherit keys if missing from the event config
 				for key in ["text_x", "text_y", "font_size", "font_color", "font_key"]:
@@ -588,6 +897,7 @@ def save_event_config(slug: str, config: dict) -> None:
 
 def save_event_csv(slug: str, content: str) -> None:
 	_write_event_csv_to_file(slug, content)
+	_EVENT_CSV_CACHE.pop(slug, None)
 	if _kv_enabled():
 		try:
 			_kv_set_raw(_event_csv_key(slug), content)
@@ -599,9 +909,11 @@ def save_event_csv(slug: str, content: str) -> None:
 def delete_event_storage(slug: str) -> None:
 	if os.path.isdir(_event_dir(slug)):
 		shutil.rmtree(_event_dir(slug))
-	# Invalidate cache for deleted event
+	delete_template_storage(slug)
+	# Invalidate caches for the deleted event
 	global _EVENT_CONFIG_CACHE
 	_EVENT_CONFIG_CACHE.pop(slug, None)
+	_EVENT_CSV_CACHE.pop(slug, None)
 	if _kv_enabled():
 		try:
 			_kv_delete_key(_event_config_key(slug))
@@ -790,10 +1102,18 @@ def load_unique_column_values(slug: str, column: str) -> list[str]:
 def validate_participant_submission(slug: str, config: dict, form_data) -> str | None:
 	validation_type = config.get("validation_type", "player_team")
 	custom_fields: list[str] = config.get("custom_fields", [])
-	rows = load_csv_rows(slug)
 
 	if validation_type == "none":
 		return None
+
+	# Parsed lazily: player_team and name_only use their own lookups below.
+	rows: list[dict[str, str]] | None = None
+
+	def csv_rows() -> list[dict[str, str]]:
+		nonlocal rows
+		if rows is None:
+			rows = load_csv_rows(slug)
+		return rows
 
 	if validation_type == "player_team":
 		registration_name = normalize_value(form_data.get("registration_name", ""))
@@ -816,7 +1136,7 @@ def validate_participant_submission(slug: str, config: dict, form_data) -> str |
 		registration_email = normalize_value(form_data.get("registration_name", ""))
 		if not registration_email:
 			return "Please fill all fields."
-		if not any(row.get("email", "") == registration_email for row in rows):
+		if not any(row.get("email", "") == registration_email for row in csv_rows()):
 			return "Email not found in participant list."
 		return None
 
@@ -824,7 +1144,7 @@ def validate_participant_submission(slug: str, config: dict, form_data) -> str |
 		registration_id = normalize_value(form_data.get("registration_name", ""))
 		if not registration_id:
 			return "Please fill all fields."
-		for row in rows:
+		for row in csv_rows():
 			if row.get("roll_no", "") == registration_id or row.get("id", "") == registration_id or row.get("badge_id", "") == registration_id or row.get("badge_number", "") == registration_id:
 				return None
 		return "Roll No not found in participant list."
@@ -839,7 +1159,7 @@ def validate_participant_submission(slug: str, config: dict, form_data) -> str |
 			if not value:
 				return "Please fill all fields."
 			expected[field["column"]] = value
-		for row in rows:
+		for row in csv_rows():
 			if all(row.get(col, "") == val for col, val in expected.items()):
 				return None
 		return "Details not found in participant list."
@@ -850,14 +1170,12 @@ def validate_participant_submission(slug: str, config: dict, form_data) -> str |
 # ─── Certificate helpers ──────────────────────────────────────────────────────
 
 def get_font(size: int, font_key: str | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-	"""Load font with caching to avoid repeated disk I/O on Render."""
-	global _FONT_CACHE
+	"""Load font with caching to avoid repeated disk I/O on every render."""
 	cache_key = f"{size}:{font_key or DEFAULT_FONT_KEY}"
-	
-	# Return cached font if available
-	if cache_key in _FONT_CACHE:
-		return _FONT_CACHE[cache_key]
-	
+	cached = _cache_get(_FONT_CACHE, cache_key)
+	if cached is not None:
+		return cached
+
 	font_option = resolve_font_option(font_key)
 	try:
 		if os.path.exists(font_option["path"]):
@@ -866,191 +1184,168 @@ def get_font(size: int, font_key: str | None = None) -> ImageFont.FreeTypeFont |
 			font = ImageFont.truetype("arial.ttf", size=size)
 	except Exception:
 		font = ImageFont.load_default()
-	
-	# Cache the font
-	if len(_FONT_CACHE) >= 20:  # Reasonable limit for font cache
-		_FONT_CACHE.clear()
-	_FONT_CACHE[cache_key] = font
-	
+
+	_cache_put(_FONT_CACHE, cache_key, font, _FONT_CACHE_MAX)
 	return font
 
 
 def _cert_metadata_path(cert_id: str) -> str:
+	"""Location of a pre-token certificate record. Retained for legacy links only."""
 	return os.path.join(GENERATED_DIR, f"{cert_id}.json")
 
 
-def _cert_image_path(cert_id: str) -> str:
-	return os.path.join(GENERATED_DIR, f"{cert_id}.png")
-
-
-def _get_cert_image_cached(cert_id: str) -> Image.Image | None:
-	"""
-	Load certificate PNG with caching to avoid repeated disk I/O on Render.
-	Returns a new copy of the cached image for safe modification.
-	"""
-	cache_key = f"cert_{cert_id}"
-	cert_path = _cert_image_path(cert_id)
-	
-	if not os.path.exists(cert_path):
-		return None
-	
-	global _TEMPLATE_IMAGE_CACHE
-	
-	# Load and cache the image if not already cached
-	if cache_key not in _TEMPLATE_IMAGE_CACHE:
-		try:
-			img = Image.open(cert_path).convert("RGBA")
-			# Limit cache to avoid memory bloat
-			if len(_TEMPLATE_IMAGE_CACHE) >= 100:
-				_TEMPLATE_IMAGE_CACHE.clear()
-			_TEMPLATE_IMAGE_CACHE[cache_key] = img
-		except Exception:
-			return None
-	
-	# Return a copy to avoid modifying the cached version
-	if cache_key in _TEMPLATE_IMAGE_CACHE:
-		return _TEMPLATE_IMAGE_CACHE[cache_key].copy()
-	
-	return None
-
-
-def _get_event_template_cached(slug: str) -> Image.Image | None:
-	"""
-	Load event template image with caching to avoid repeated disk I/O.
-	Returns a new copy of the cached image for safe modification.
-	"""
-	cache_key = f"template_{slug}"
-	template_path = _event_template_path(slug)
-	
-	if not os.path.exists(template_path):
-		return None
-	
-	global _TEMPLATE_IMAGE_CACHE
-	
-	# Load and cache the image if not already cached
-	if cache_key not in _TEMPLATE_IMAGE_CACHE:
-		try:
-			img = Image.open(template_path).convert("RGBA")
-			# Limit cache to avoid memory bloat
-			if len(_TEMPLATE_IMAGE_CACHE) >= 100:
-				_TEMPLATE_IMAGE_CACHE.clear()
-			_TEMPLATE_IMAGE_CACHE[cache_key] = img
-		except Exception:
-			return None
-	
-	# Return a copy to avoid modifying the cached version
-	if cache_key in _TEMPLATE_IMAGE_CACHE:
-		return _TEMPLATE_IMAGE_CACHE[cache_key].copy()
-	
-	return None
-
-
-def _render_certificate_to_bytes(cert_id: str, metadata: dict) -> tuple[bytes, str]:
-	"""
-	Render certificate image to PNG bytes with text overlay.
-	Returns (png_bytes, etag) where etag is based on metadata.
-	Caches result to avoid reprocessing on subsequent requests.
-	"""
-	global _RENDERED_CERT_CACHE
-	
-	# Check cache first
-	if cert_id in _RENDERED_CERT_CACHE:
-		return _RENDERED_CERT_CACHE[cert_id]
-	
-	# Generate cache key/etag based on metadata
-	metadata_str = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
-	etag = hashlib.md5(metadata_str.encode()).hexdigest()
-	
-	# Render the image (use cached version to avoid disk I/O)
-	image = _get_cert_image_cached(cert_id)
-	if image is None:
-		# Fallback: try to load directly (shouldn't happen in normal flow)
-		cert_path = _cert_image_path(cert_id)
-		if not os.path.exists(cert_path):
-			return (b"", "")
-		image = Image.open(cert_path).convert("RGBA")
-	
-	draw_name_on_image(image, metadata)
-	
-	# Save to bytes (no optimize - caching is our bottleneck relief)
-	output = BytesIO()
-	image.save(output, format="PNG")
-	png_bytes = output.getvalue()
-	
-	# Store in cache (with simple LRU by clearing if too large)
-	if len(_RENDERED_CERT_CACHE) >= _RENDERED_CERT_CACHE_MAX_SIZE:
-		_RENDERED_CERT_CACHE.clear()
-	
-	_RENDERED_CERT_CACHE[cert_id] = (png_bytes, etag)
-	return png_bytes, etag
-
-
-def generate_certificate_file(slug: str, cert_name: str, event_config: dict) -> str:
-	# Use cached template to avoid repeated disk I/O on Render
-	image = _get_event_template_cached(slug)
-	if image is None:
-		# Fallback to direct loading (shouldn't happen in normal flow)
-		image = Image.open(_event_template_path(slug)).convert("RGBA")
-	else:
-		image = image.copy()  # Make a copy to avoid modifying the cache
-	
-	cert_id = uuid4().hex
-	# Save PNG without optimization to keep POST response fast
-	image.save(_cert_image_path(cert_id), format="PNG")
-	metadata = {
-		"event_slug": slug,
-		"cert_name": cert_name,
-		"text_x": event_config.get("text_x", 1789),
-		"text_y": event_config.get("text_y", 1440),
-		"font_size": event_config.get("font_size", 100),
-		"font_color": event_config.get("font_color", [50, 34, 24]),
-		"font_key": normalize_font_key(event_config.get("font_key"), DEFAULT_FONT_KEY),
+def certificate_render_settings(config: dict) -> dict:
+	"""The subset of an event config that actually affects the rendered image."""
+	return {
+		"text_x": config.get("text_x", 1789),
+		"text_y": config.get("text_y", 1440),
+		"font_size": config.get("font_size", 100),
+		"font_color": config.get("font_color", [50, 34, 24]),
+		"font_key": normalize_font_key(config.get("font_key"), DEFAULT_FONT_KEY),
 	}
-	with open(_cert_metadata_path(cert_id), "w", encoding="utf-8") as f:
-		json.dump(metadata, f)
-	return cert_id
 
 
-def load_cert_metadata(cert_id: str) -> dict | None:
+def encode_certificate(image: Image.Image, variant: str = "download") -> tuple[bytes, str]:
+	"""
+	Encode a rendered certificate. Returns (bytes, mimetype).
+
+	"preview" is what the browser shows in an <img>: downscaled and JPEG, because
+	nobody looks at 3508 px on a phone and the full-size PNG is ~2.5 MB.
+	"download" is the real artifact: full resolution PNG.
+	"""
+	has_alpha = image.mode in ("RGBA", "LA")
+	if variant == "preview":
+		if image.width > PREVIEW_MAX_WIDTH:
+			# BOX is the cheapest filter that still looks clean at a ~3x reduction.
+			image.thumbnail((PREVIEW_MAX_WIDTH, PREVIEW_MAX_WIDTH), Image.BOX)
+		if not has_alpha:
+			output = BytesIO()
+			image.save(output, format="JPEG", quality=PREVIEW_JPEG_QUALITY)
+			return output.getvalue(), "image/jpeg"
+	output = BytesIO()
+	image.save(output, format="PNG", compress_level=DOWNLOAD_PNG_COMPRESS_LEVEL)
+	return output.getvalue(), "image/png"
+
+
+def render_certificate(slug: str, cert_name: str, config: dict,
+					   variant: str = "download") -> tuple[bytes, str, str] | None:
+	"""
+	Render a certificate on demand and return (image_bytes, etag, mimetype).
+
+	Nothing is written to disk: the template plus the event config plus the name is
+	everything needed to reproduce the image, so any worker can serve any link.
+	The etag covers the template version, every render setting, and the variant, so
+	replacing a template or moving the text produces a new etag instead of a stale
+	cache hit.
+	"""
+	settings = certificate_render_settings(config)
+	fingerprint = json.dumps(
+		{
+			"slug": slug,
+			"name": cert_name,
+			"template": template_version_for(slug, config),
+			"settings": settings,
+			"variant": variant,
+		},
+		sort_keys=True,
+		separators=(",", ":"),
+	)
+	etag = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+	cached = _cache_get(_RENDERED_CERT_CACHE, etag)
+	if cached is not None:
+		return cached
+
+	image = get_template_image(slug, config)
+	if image is None:
+		return None
+
+	metadata = dict(settings)
+	metadata["cert_name"] = cert_name
+	draw_name_on_image(image, metadata)
+
+	image_bytes, mimetype = encode_certificate(image, variant)
+	result = (image_bytes, etag, mimetype)
+	_cache_put(_RENDERED_CERT_CACHE, etag, result, _RENDER_CACHE_MAX)
+	return result
+
+
+# ─── Certificate links ────────────────────────────────────────────────────────
+#
+# A certificate link is a signed token carrying the event slug and the printed
+# name, not a pointer to a stored file. Links are unguessable without SECRET_KEY,
+# survive restarts and redeploys, and work on any worker.
+
+_CERT_TOKEN_SALT = "certificate-link-v1"
+
+
+def _cert_serializer() -> URLSafeSerializer:
+	return URLSafeSerializer(app.secret_key, salt=_CERT_TOKEN_SALT)
+
+
+def make_cert_token(slug: str, cert_name: str) -> str:
+	return _cert_serializer().dumps({"s": slug, "n": cert_name})
+
+
+def read_cert_token(token: str) -> tuple[str, str] | None:
+	try:
+		payload = _cert_serializer().loads(token)
+	except BadSignature:
+		return None
+	if not isinstance(payload, dict):
+		return None
+	slug = str(payload.get("s", ""))
+	cert_name = str(payload.get("n", ""))
+	if not safe_slug(slug) or not cert_name:
+		return None
+	return slug, cert_name
+
+
+def _legacy_cert_record(cert_id: str) -> tuple[str, str] | None:
+	"""Resolve a pre-token certificate id from its on-disk metadata file."""
 	path = _cert_metadata_path(cert_id)
 	if not os.path.exists(path):
 		return None
-	with open(path, encoding="utf-8") as f:
-		return json.load(f)
-
-
-def build_render_metadata(cert_id: str) -> dict | None:
-	metadata = load_cert_metadata(cert_id)
-	if metadata is None:
+	try:
+		with open(path, encoding="utf-8") as f:
+			metadata = json.load(f)
+	except (OSError, json.JSONDecodeError):
 		return None
-	event_slug = metadata.get("event_slug", "")
-	event_config = load_event(event_slug) if event_slug else None
-	if event_config is None:
-		return metadata
-	render_metadata = dict(metadata)
-	for key, fallback in (
-		("text_x", 1789),
-		("text_y", 1440),
-		("font_size", 100),
-		("font_color", [50, 34, 24]),
-		("font_key", DEFAULT_FONT_KEY),
-	):
-		render_metadata[key] = event_config.get(key, metadata.get(key, fallback))
-	render_metadata["font_key"] = normalize_font_key(render_metadata.get("font_key"), DEFAULT_FONT_KEY)
-	return render_metadata
+	if not isinstance(metadata, dict):
+		return None
+	slug = str(metadata.get("event_slug", ""))
+	cert_name = str(metadata.get("cert_name", ""))
+	if not safe_slug(slug) or not cert_name:
+		return None
+	return slug, cert_name
+
+
+def resolve_cert_token(token: str) -> tuple[str, str] | None:
+	"""Accept a signed token, or a legacy 32-hex id still sitting on local disk."""
+	resolved = read_cert_token(token)
+	if resolved is not None:
+		return resolved
+	if re.match(r"^[a-f0-9]{32}$", token):
+		return _legacy_cert_record(token)
+	return None
 
 
 def draw_name_on_image(image: Image.Image, metadata: dict) -> None:
 	draw = ImageDraw.Draw(image)
 	font = get_font(metadata.get("font_size", 100), metadata.get("font_key"))
-	color = tuple(metadata.get("font_color", [50, 34, 24]))
-	draw.text(
-		(metadata.get("text_x", 1789), metadata.get("text_y", 1440)),
-		metadata.get("cert_name", ""),
-		fill=color,
-		font=font,
-		anchor="mm",
-	)
+	raw_color = metadata.get("font_color", [50, 34, 24])
+	try:
+		color = tuple(int(channel) for channel in raw_color)[:3]
+	except (TypeError, ValueError):
+		color = (50, 34, 24)
+	position = (metadata.get("text_x", 1789), metadata.get("text_y", 1440))
+	text = metadata.get("cert_name", "")
+	# anchor= is only supported by truetype fonts; load_default() is the fallback
+	# when the bundled TTF is missing, and would raise instead of degrading.
+	if isinstance(font, ImageFont.FreeTypeFont):
+		draw.text(position, text, fill=color, font=font, anchor="mm")
+	else:
+		draw.text(position, text, fill=color, font=font)
 
 
 def safe_download_name(name: str, slug: str) -> str:
@@ -1062,26 +1357,35 @@ def safe_download_name(name: str, slug: str) -> str:
 	return f"{cleaned}.png"
 
 
-def _is_valid_image(stream, filename: str) -> bool:
-	"""Validate that file is a valid image (PNG, JPG, GIF, WebP)."""
-	header = stream.read(12)
-	stream.seek(0)
-	ext = os.path.splitext(filename)[1].lower()
-	
-	# PNG: 89 50 4E 47
-	if ext == '.png' and header[:8] == b"\x89PNG\r\n\x1a\n":
-		return True
-	# JPEG: FF D8 FF
-	if ext in ['.jpg', '.jpeg'] and header[:3] == b"\xff\xd8\xff":
-		return True
-	# GIF: 47 49 46
-	if ext == '.gif' and header[:6] in [b"GIF87a", b"GIF89a"]:
-		return True
-	# WebP: RIFF ... WEBP
-	if ext == '.webp' and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-		return True
-	
+def _has_image_magic(data: bytes, ext: str) -> bool:
+	"""Check that the file content matches the extension it claims."""
+	header = data[:12]
+	if ext == ".png":
+		return header[:8] == b"\x89PNG\r\n\x1a\n"
+	if ext in (".jpg", ".jpeg"):
+		return header[:3] == b"\xff\xd8\xff"
+	if ext == ".gif":
+		return header[:6] in (b"GIF87a", b"GIF89a")
+	if ext == ".webp":
+		return header[:4] == b"RIFF" and header[8:12] == b"WEBP"
 	return False
+
+
+def validate_template_upload(data: bytes, ext: str) -> str | None:
+	"""Return an error message for a rejected template, or None when it is usable."""
+	if not _has_image_magic(data, ext):
+		return "File does not appear to be a valid image."
+	try:
+		with Image.open(BytesIO(data)) as probe:
+			probe.verify()
+		with Image.open(BytesIO(data)) as probe:
+			width, height = probe.size
+	except Exception:
+		return "That image could not be decoded. Try re-exporting it."
+	if width * height > MAX_TEMPLATE_PIXELS:
+		megapixels = MAX_TEMPLATE_PIXELS // 1_000_000
+		return f"Template is too large ({width}x{height}). The maximum is {megapixels} megapixels."
+	return None
 
 
 def _parse_int(value: str | None, fallback: int) -> int:
@@ -1122,7 +1426,61 @@ def inject_style_context() -> dict:
 	return {
 		"font_options": available_font_options(),
 		"default_font_key": normalize_font_key(DEFAULT_FONT_KEY),
+		# A callable, so only templates that actually render a form mint a token.
+		"csrf_token": csrf_token,
+		"validation_type_labels": VALIDATION_TYPE_LABELS,
 	}
+
+
+# ─── CSRF ─────────────────────────────────────────────────────────────────────
+#
+# Every state-changing request must carry a token tied to the caller's session.
+# Enforcement is fail-closed and applies to all unsafe methods by default, so a
+# route added later is protected without anyone remembering to protect it.
+
+CSRF_FIELD_NAME = "csrf_token"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+CSRF_UNSAFE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+_CSRF_EXEMPT_ENDPOINTS: set[str] = set()
+
+
+def csrf_exempt(view):
+	"""Opt a route out of CSRF validation. Nothing needs this today."""
+	_CSRF_EXEMPT_ENDPOINTS.add(view.__name__)
+	return view
+
+
+def csrf_token() -> str:
+	"""Current session token, minted on first use. Exposed to templates."""
+	token = session.get(CSRF_FIELD_NAME)
+	if not isinstance(token, str) or not token:
+		token = secrets.token_urlsafe(32)
+		session[CSRF_FIELD_NAME] = token
+	return token
+
+
+def _submitted_csrf_token() -> str:
+	form_value = request.form.get(CSRF_FIELD_NAME, "")
+	if form_value:
+		return form_value
+	return request.headers.get(CSRF_HEADER_NAME, "")
+
+
+@app.before_request
+def _enforce_csrf():
+	if request.method not in CSRF_UNSAFE_METHODS:
+		return None
+	if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
+		return None
+
+	expected = session.get(CSRF_FIELD_NAME, "")
+	submitted = _submitted_csrf_token()
+	if expected and submitted and hmac.compare_digest(str(expected), submitted):
+		return None
+
+	if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+		return jsonify({"ok": False, "error": "Session expired. Reload the page and try again."}), 400
+	return render_template("csrf_error.html"), 400
 
 
 # ─── Admin auth ───────────────────────────────────────────────────────────────
@@ -1167,66 +1525,69 @@ def download_certificate(slug: str):
 	validation_error = validate_participant_submission(slug, config, request.form)
 	if validation_error:
 		return render_template("event.html", **event_form_context(config, slug, validation_error)), 400
-	if not os.path.exists(_event_template_path(slug)):
+	if not has_template(slug, config):
 		return render_template("event.html", **event_form_context(config, slug, "Certificate template not found on server.")), 500
-	try:
-		cert_id = generate_certificate_file(slug, cert_name, config)
-	except Exception:
-		return render_template("event.html", **event_form_context(config, slug, "Something went wrong generating your certificate.")), 500
-	return redirect(url_for("preview_page", cert_id=cert_id))
+	# The image is rendered on demand from the token, so this POST stays cheap.
+	return redirect(url_for("preview_page", token=make_cert_token(slug, cert_name)))
 
 
-@app.route("/preview/<cert_id>", methods=["GET"])
-def preview_page(cert_id: str):
-	if not re.match(r"^[a-f0-9]{32}$", cert_id):
+def _certificate_from_token(token: str) -> tuple[str, str, dict] | None:
+	"""Resolve a certificate link to (slug, printed name, live event config)."""
+	resolved = resolve_cert_token(token)
+	if resolved is None:
+		return None
+	slug, cert_name = resolved
+	config = load_event(slug)
+	if config is None:
+		return None
+	return slug, cert_name, config
+
+
+@app.route("/preview/<token>", methods=["GET"])
+def preview_page(token: str):
+	resolved = _certificate_from_token(token)
+	if resolved is None:
 		return redirect(url_for("home"))
-	metadata = load_cert_metadata(cert_id)
-	if metadata is None or not os.path.exists(_cert_image_path(cert_id)):
-		return redirect(url_for("home"))
-	event = load_event(metadata["event_slug"])
-	return render_template("preview.html", cert_id=cert_id, cert_name=metadata["cert_name"], event=event)
+	_, cert_name, config = resolved
+	return render_template("preview.html", cert_token=token, cert_name=cert_name, event=config)
 
 
-@app.route("/preview-image/<cert_id>", methods=["GET"])
-def preview_image(cert_id: str):
-	if not re.match(r"^[a-f0-9]{32}$", cert_id):
+@app.route("/preview-image/<token>", methods=["GET"])
+def preview_image(token: str):
+	resolved = _certificate_from_token(token)
+	if resolved is None:
 		return ("Not found", 404)
-	metadata = build_render_metadata(cert_id)
-	if metadata is None or not os.path.exists(_cert_image_path(cert_id)):
+	slug, cert_name, config = resolved
+	rendered = render_certificate(slug, cert_name, config, variant="preview")
+	if rendered is None:
 		return ("Not found", 404)
-	
-	# Use cached rendering to avoid reprocessing image
-	png_bytes, etag = _render_certificate_to_bytes(cert_id, metadata)
-	
-	# Add caching headers for browser optimization
-	response = send_file(
-		BytesIO(png_bytes),
-		mimetype="image/png",
-		etag=etag
-	)
-	# Cache for 1 year (immutable because cert_id won't change)
-	response.cache_control.max_age = 31536000
-	response.cache_control.public = True
-	response.cache_control.immutable = True
+	image_bytes, etag, mimetype = rendered
+
+	response = send_file(BytesIO(image_bytes), mimetype=mimetype, etag=etag)
+	# The image carries a participant's name, and it changes whenever an admin
+	# edits the template or coordinates, so: private, revalidated, never immutable.
+	response.cache_control.private = True
+	response.cache_control.max_age = 300
+	response.cache_control.must_revalidate = True
 	return response
 
 
-@app.route("/download-file/<cert_id>", methods=["GET"])
-def download_file(cert_id: str):
-	if not re.match(r"^[a-f0-9]{32}$", cert_id):
+@app.route("/download-file/<token>", methods=["GET"])
+def download_file(token: str):
+	resolved = _certificate_from_token(token)
+	if resolved is None:
 		return ("Not found", 404)
-	metadata = build_render_metadata(cert_id)
-	if metadata is None or not os.path.exists(_cert_image_path(cert_id)):
+	slug, cert_name, config = resolved
+	rendered = render_certificate(slug, cert_name, config, variant="download")
+	if rendered is None:
 		return ("Not found", 404)
-	
-	# Use cached rendering to avoid reprocessing image
-	png_bytes, _ = _render_certificate_to_bytes(cert_id, metadata)
-	
+	image_bytes, _, mimetype = rendered
+
 	return send_file(
-		BytesIO(png_bytes),
-		mimetype="image/png",
+		BytesIO(image_bytes),
+		mimetype=mimetype,
 		as_attachment=True,
-		download_name=safe_download_name(metadata["cert_name"], metadata.get("event_slug", "event")),
+		download_name=safe_download_name(cert_name, slug),
 	)
 
 
@@ -1239,8 +1600,12 @@ def admin_login():
 		password = request.form.get("password", "")
 		if not ADMIN_PASSWORD:
 			error = "ADMIN_PASSWORD environment variable is not set on this server."
-		elif password == ADMIN_PASSWORD:
+		elif hmac.compare_digest(password, ADMIN_PASSWORD):
+			# New token for the newly privileged session, so a token an attacker
+			# may have observed pre-login cannot be replayed against admin routes.
+			session.clear()
 			session["admin_logged_in"] = True
+			csrf_token()
 			return redirect(url_for("admin_dashboard"))
 		else:
 			error = "Incorrect password."
@@ -1249,7 +1614,7 @@ def admin_login():
 
 @app.route("/admin/logout", methods=["POST"])
 def admin_logout():
-	session.pop("admin_logged_in", None)
+	session.clear()
 	return redirect(url_for("admin_login"))
 
 
@@ -1310,7 +1675,7 @@ def admin_edit_event(slug: str):
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
 	return render_template("admin/event_form.html", event=config, is_new=False, error=None,
-						   has_template=os.path.exists(_event_template_path(slug)),
+						   has_template=has_template(slug, config),
 						   has_csv=_event_csv_exists(slug),
 						   csv_columns=csv_headers(slug))
 
@@ -1345,7 +1710,7 @@ def admin_update_config(slug: str):
 	if request.headers.get("X-Requested-With") == "XMLHttpRequest":
 		return jsonify({"ok": True, "message": "Settings saved."})
 	return render_template("admin/event_form.html", event=config, is_new=False, success="Settings saved.",
-						   error=None, has_template=os.path.exists(_event_template_path(slug)),
+						   error=None, has_template=has_template(slug, config),
 						   has_csv=_event_csv_exists(slug),
 						   csv_columns=csv_headers(slug))
 
@@ -1359,40 +1724,44 @@ def admin_upload_template(slug: str):
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
 	has_csv = _event_csv_exists(slug)
-	has_template = os.path.exists(_event_template_path(slug))
+	template_present = has_template(slug, config)
 	file = request.files.get("template_file")
 	if not file or file.filename == "":
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="No file selected.", has_template=has_template, has_csv=has_csv,
+							   error="No file selected.", has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
-	
+
 	filename = secure_filename(file.filename).lower()
-	valid_exts = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
-	if not any(filename.endswith(ext) for ext in valid_exts):
-		return render_template("admin/event_form.html", event=config, is_new=False,
-						   error="Template must be PNG, JPG, GIF, or WebP.", has_template=has_template, has_csv=has_csv,
-						   csv_columns=csv_headers(slug)), 400
-	
-	if not _is_valid_image(file.stream, filename):
-		return render_template("admin/event_form.html", event=config, is_new=False,
-						   error="File does not appear to be a valid image.", has_template=has_template, has_csv=has_csv,
-						   csv_columns=csv_headers(slug)), 400
-	
-	# Delete existing template files with any extension
-	os.makedirs(_event_dir(slug), exist_ok=True)
-	for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']:
-		old_path = os.path.join(_event_dir(slug), f"template{ext}")
-		if os.path.exists(old_path):
-			os.remove(old_path)
-	
-	# Save new template with its original extension
-	file.stream.seek(0)
 	ext = os.path.splitext(filename)[1].lower()
-	new_path = os.path.join(_event_dir(slug), f"template{ext}")
-	file.save(new_path)
+	if ext not in TEMPLATE_EXTENSIONS:
+		return render_template("admin/event_form.html", event=config, is_new=False,
+				error="Template must be PNG, JPG, GIF, or WebP.", has_template=template_present, has_csv=has_csv,
+				csv_columns=csv_headers(slug)), 400
+
+	file.stream.seek(0)
+	data = file.stream.read()
+	validation_error = validate_template_upload(data, ext)
+	if validation_error:
+		return render_template("admin/event_form.html", event=config, is_new=False,
+				error=validation_error, has_template=template_present, has_csv=has_csv,
+				csv_columns=csv_headers(slug)), 400
+
+	try:
+		version = save_template_bytes(slug, data, ext)
+	except Exception:
+		return render_template("admin/event_form.html", event=config, is_new=False,
+				error="Could not save the template to storage. Check the Supabase settings and try again.",
+				has_template=template_present, has_csv=has_csv,
+				csv_columns=csv_headers(slug)), 502
+
+	# Recording the version on the config is what invalidates every image cache:
+	# render keys embed it, so a replaced template can never be served stale.
+	config["template_ext"] = ext
+	config["template_version"] = version
+	save_event_config(slug, config)
 	return render_template("admin/event_form.html", event=config, is_new=False,
-						   success="Template uploaded successfully.", error=None, has_template=True, has_csv=has_csv,
-						   csv_columns=csv_headers(slug))
+				success="Template uploaded successfully.", error=None, has_template=True, has_csv=has_csv,
+				csv_columns=csv_headers(slug))
 
 
 @app.route("/admin/events/<slug>/upload-csv", methods=["POST"])
@@ -1403,16 +1772,16 @@ def admin_upload_csv(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
-	has_template = os.path.exists(_event_template_path(slug))
+	template_present = has_template(slug, config)
 	has_csv = _event_csv_exists(slug)
 	file = request.files.get("csv_file")
 	if not file or file.filename == "":
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="No file selected.", has_template=has_template, has_csv=has_csv,
+							   error="No file selected.", has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
 	if not secure_filename(file.filename).lower().endswith(".csv"):
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="Participants file must be a .csv.", has_template=has_template, has_csv=has_csv,
+							   error="Participants file must be a .csv.", has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
 	content = file.stream.read().decode("utf-8", errors="replace")
 	validation_type = config.get("validation_type", "player_team")
@@ -1420,7 +1789,7 @@ def admin_upload_csv(slug: str):
 	if validation_type == "custom" and not custom_fields:
 		return render_template("admin/event_form.html", event=config, is_new=False,
 							   error="Select at least one custom field in Event Settings before uploading CSV.",
-							   has_template=has_template, has_csv=has_csv,
+							   has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
 	required_headers = required_headers_for_validation(validation_type, custom_fields)
 	try:
@@ -1429,21 +1798,21 @@ def admin_upload_csv(slug: str):
 		if validation_type == "badge_id" and not ({"roll_no", "id", "badge_id", "badge_number"} & headers):
 			return render_template("admin/event_form.html", event=config, is_new=False,
 								   error="CSV must include one of: roll_no, id, badge_id, badge_number.",
-								   has_template=has_template, has_csv=has_csv,
+								   has_template=template_present, has_csv=has_csv,
 								   csv_columns=sorted(headers)), 400
 		if not required_headers.issubset(headers):
 			missing = ", ".join(sorted(required_headers - headers))
 			return render_template("admin/event_form.html", event=config, is_new=False,
 								   error=f"CSV is missing required column(s): {missing}.",
-							   has_template=has_template, has_csv=has_csv,
+							   has_template=template_present, has_csv=has_csv,
 							   csv_columns=sorted(headers)), 400
 	except Exception:
 		return render_template("admin/event_form.html", event=config, is_new=False,
-							   error="Could not parse CSV file.", has_template=has_template, has_csv=has_csv,
+							   error="Could not parse CSV file.", has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
 	save_event_csv(slug, content)
 	return render_template("admin/event_form.html", event=config, is_new=False,
-						   success="Participants CSV uploaded.", error=None, has_template=has_template, has_csv=True,
+						   success="Participants CSV uploaded.", error=None, has_template=template_present, has_csv=True,
 						   csv_columns=csv_headers(slug))
 
 
@@ -1466,19 +1835,19 @@ def admin_toggle_event(slug: str):
 def admin_send_emails(slug: str):
 	if not _event_exists(slug):
 		return redirect(url_for("admin_dashboard"))
-		
+
 	event_config = load_event(slug)
-	
+
 	if request.method == "GET":
 		return render_template(
 			"admin/email_form.html",
 			event=event_config
 		)
-	
+
 	subject_template = request.form.get("subject_template")
 	plain_body_template = request.form.get("plain_body_template")
 	html_body_template = request.form.get("html_body_template")
-	
+
 	# Update coordinates if they were changed
 	if request.form.get("text_x"):
 		event_config["text_x"] = int(request.form.get("text_x"))
@@ -1491,26 +1860,26 @@ def admin_send_emails(slug: str):
 		event_config["font_color"] = [int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)]
 	if request.form.get("font_key"):
 		event_config["font_key"] = normalize_font_key(request.form.get("font_key"))
-	
+
 	save_event_config(slug, event_config)
-	
+
 	import threading
 	try:
 		from manage import bulk_generate
-		
+
 		def background_task():
 			try:
-				bulk_generate(slug, send_emails=True, 
+				bulk_generate(slug, send_emails=True,
 							  subject_template=subject_template,
 							  plain_body_template=plain_body_template,
 							  html_body_template=html_body_template)
 			except Exception as e:
 				print(f"Background email task failed: {e}")
-				
+
 		thread = threading.Thread(target=background_task)
 		thread.daemon = True
 		thread.start()
-		
+
 		return "<script>alert('Email sending has started in the background! Check server logs for progress.'); window.location.href='/admin/logs';</script>"
 	except ImportError:
 		return "manage.py module not found", 500
@@ -1520,12 +1889,12 @@ def admin_send_emails(slug: str):
 @require_admin
 def admin_logs():
 	"""View the system.log file generated by background tasks."""
-	log_path = os.path.join(BASE_DIR, "logs", "system.log")
 	logs_content = ""
-	if os.path.exists(log_path):
+	if os.path.exists(LOG_FILE):
 		try:
-			with open(log_path, "r", encoding="utf-8") as f:
-				logs_content = f.read()
+			# Only the tail is useful, and the file is never rotated.
+			with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+				logs_content = "".join(f.readlines()[-2000:])
 		except Exception as e:
 			logs_content = f"Error reading logs: {e}"
 	return render_template("admin/logs.html", logs=logs_content)
@@ -1534,10 +1903,9 @@ def admin_logs():
 @require_admin
 def admin_clear_logs():
 	"""Clear the system.log file."""
-	log_path = os.path.join(BASE_DIR, "logs", "system.log")
-	if os.path.exists(log_path):
+	if os.path.exists(LOG_FILE):
 		try:
-			with open(log_path, "w", encoding="utf-8") as f:
+			with open(LOG_FILE, "w", encoding="utf-8") as f:
 				f.write("")
 		except Exception as e:
 			print(f"Error clearing logs: {e}")
@@ -1574,10 +1942,21 @@ def admin_template_preview(slug: str):
 	"""Serve certificate template image for canvas preview in event editor."""
 	if not safe_slug(slug):
 		return "Not found", 404
-	template_path = _event_template_path(slug)
-	if not os.path.exists(template_path):
+	config = load_event(slug)
+	if config is None:
+		return "Not found", 404
+	data = load_template_bytes(slug, config)
+	if data is None:
 		return "Template not found", 404
-	return send_file(template_path)
+	ext = template_ext_for(slug, config)
+	response = send_file(
+		BytesIO(data),
+		mimetype=TEMPLATE_CONTENT_TYPES.get(ext, "application/octet-stream"),
+		etag=template_version_for(slug, config),
+	)
+	response.cache_control.private = True
+	response.cache_control.max_age = 60
+	return response
 
 
 @app.route("/admin/events/<slug>/render-preview", methods=["GET"])
@@ -1589,20 +1968,36 @@ def admin_render_preview(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return "Not found", 404
-	template_path = _event_template_path(slug)
-	if not os.path.exists(template_path):
+	image = get_template_image(slug, config)
+	if image is None:
 		return "Template not found", 404
-	image = Image.open(template_path).convert("RGBA")
 	metadata = build_preview_metadata(config, request.args.get("cert_name"))
 	draw_name_on_image(image, metadata)
-	output = BytesIO()
-	image.save(output, format="PNG")
-	output.seek(0)
-	response = send_file(output, mimetype="image/png")
+	image_bytes, mimetype = encode_certificate(image, variant="preview")
+	response = send_file(BytesIO(image_bytes), mimetype=mimetype)
 	# Short cache for admin previews (they may change as settings are edited)
 	response.cache_control.max_age = 60
 	response.cache_control.public = True
 	return response
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+	"""
+	Keep-alive endpoint for the warm-up cron.
+
+	It deliberately touches Supabase: free Supabase projects pause after about a
+	week of inactivity, and the app only reads storage on a cache miss, so pinging
+	Flask alone would not be enough to keep the storage project awake.
+	"""
+	storage = "disabled"
+	if _supabase_enabled():
+		try:
+			_supabase_ping()
+			storage = "ok"
+		except Exception:
+			storage = "error"
+	return jsonify({"ok": True, "storage": storage})
 
 
 @app.route("/assets/fonts/<font_key>.ttf", methods=["GET"])

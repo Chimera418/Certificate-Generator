@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Request Expired – Certificate Portal</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="card">
+        <h1>Request Expired</h1>
+        <p class="card-subtitle">That form could not be verified.</p>
+
+        <p class="error">
+          This usually means the page sat open too long, or cookies are blocked in
+          your browser. Nothing was changed.
+        </p>
+
+        <p class="muted-text">Go back, reload the page, and submit the form again.</p>
+
+        <div class="back-link-row">
+          <a href="{{ url_for('home') }}" class="back-link">← Back to site</a>
+        </div>
+      </section>
+    </main>
+    <footer class="site-footer">Crafted with 💕 -- CSI</footer>
+  </body>
+</html>

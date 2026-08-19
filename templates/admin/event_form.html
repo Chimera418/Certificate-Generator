@@ -13,6 +13,7 @@
         <div class="admin-header-actions">
           <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">← Dashboard</a>
           <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <button class="admin-nav-btn" type="submit">Log Out</button>
           </form>
         </div>
@@ -39,6 +40,7 @@
             method="post"
             class="form admin-form"
           >
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <label for="name">Event Name</label>
             <input
               id="name" name="name" type="text"
@@ -249,6 +251,7 @@
             enctype="multipart/form-data"
             class="form admin-form"
           >
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <label for="template_file">{{ 'Replace template' if has_template else 'Upload template' }} (PNG, JPG, GIF, WebP)</label>
             <input id="template_file" name="template_file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,image/png,image/jpeg,image/gif,image/webp" required />
             <p class="field-hint">The participant's name will be printed at the X/Y coordinates configured above.</p>
@@ -270,6 +273,7 @@
             enctype="multipart/form-data"
             class="form admin-form"
           >
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <label for="csv_file">{{ 'Replace CSV' if has_csv else 'Upload CSV' }}</label>
             <input id="csv_file" name="csv_file" type="file" accept=".csv,text/csv" required />
             <p class="field-hint">
@@ -303,6 +307,7 @@
             </a>
           </p>
           <form action="{{ url_for('admin_toggle_event', slug=event.slug) }}" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             {% if event.active %}
             <button type="submit" class="button-link danger">Deactivate Event</button>
             {% else %}

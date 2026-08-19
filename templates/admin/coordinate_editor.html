@@ -140,6 +140,7 @@
         <h3>Text Position</h3>
         <p class="field-hint" id="coordSaveStatus">Settings autosave after changes.</p>
         <form id="editorForm" method="post" action="{{ url_for('admin_update_config', slug=event.slug) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
           <div class="coord-editor-control">
             <label for="text_x">X Position (px)</label>
             <input

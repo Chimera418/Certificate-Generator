@@ -13,6 +13,7 @@
         <div class="admin-header-actions">
           <a href="{{ url_for('admin_dashboard') }}" class="admin-nav-link">Back to Dashboard</a>
           <form action="{{ url_for('admin_logout') }}" method="post" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
             <button class="admin-nav-btn" type="submit">Log Out</button>
           </form>
         </div>
@@ -26,6 +27,7 @@
               <p class="admin-subtitle">View background job and email delivery logs</p>
             </div>
             <form method="post" action="{{ url_for('admin_clear_logs') }}" onsubmit="return confirm('Are you sure you want to clear all logs?');">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
               <button class="admin-action-btn danger" type="submit">Clear Logs</button>
             </form>
           </div>
