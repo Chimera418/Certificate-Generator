@@ -1,4 +1,6 @@
+import html
 import os
+import re
 import smtplib
 import ssl
 from email.mime.image import MIMEImage
@@ -9,6 +11,38 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Only a bare {name} is a placeholder. Deliberately no support for dots, indexes,
+# conversions or format specs - see fill_placeholders().
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+PLACEHOLDERS = ("participant_name", "event_name")
+
+
+def fill_placeholders(template: str, values: dict, escape_html: bool = False) -> str:
+    """
+    Substitute {participant_name} / {event_name} into an admin-authored template.
+
+    This deliberately does not use str.format(). Two reasons:
+
+    1. str.format() on an operator-supplied string allows attribute traversal -
+       "{event_name.__class__.__init__.__globals__}" walks straight out of the
+       template and into process internals.
+    2. str.format() raises on any brace it does not understand, so a single CSS
+       rule in an HTML body ("body { margin: 0 }") aborts that participant's send
+       with a KeyError.
+
+    Unknown placeholders and stray braces are left exactly as written.
+    """
+    def substitute(match: re.Match) -> str:
+        key = match.group(1)
+        if key not in values:
+            return match.group(0)
+        value = str(values[key])
+        return html.escape(value) if escape_html else value
+
+    return _PLACEHOLDER_RE.sub(substitute, template or "")
+
 
 class EmailSender:
     def __init__(self):
@@ -25,17 +59,18 @@ class EmailSender:
                          subject_template: str = None, plain_body_template: str = None, html_body_template: str = None) -> None:
         try:
             message = MIMEMultipart("alternative")
-            
+            values = {"participant_name": participant_name, "event_name": event_name}
+
             # Format subject
             subject = subject_template or "Your Certificate for {event_name}"
-            message["Subject"] = subject.format(participant_name=participant_name, event_name=event_name)
-            
+            message["Subject"] = fill_placeholders(subject, values)
+
             message["From"] = formataddr((self.from_name, self.from_address))
             message["To"] = participant_email
 
             # Add plain text version
             plain_tmpl = plain_body_template or "Hello {participant_name},\n\nAttached is your certificate for {event_name}. Congratulations!\n\nBest regards,\nThe Organizers"
-            plain_body = plain_tmpl.format(participant_name=participant_name, event_name=event_name)
+            plain_body = fill_placeholders(plain_tmpl, values)
             text_part = MIMEText(plain_body, "plain", "utf-8")
             message.attach(text_part)
 
@@ -49,7 +84,8 @@ class EmailSender:
                 </body>
             </html>
             """
-            html_body = html_tmpl.format(participant_name=participant_name, event_name=event_name)
+            # Escaped here: a name like "Tom & Jerry" would otherwise emit broken markup.
+            html_body = fill_placeholders(html_tmpl, values, escape_html=True)
             html_part = MIMEText(html_body, "html", "utf-8")
             message.attach(html_part)
 
@@ -62,12 +98,12 @@ class EmailSender:
             image_part = MIMEImage(certificate_bytes, name=cert_file.name)
             image_part.add_header("Content-Disposition", "attachment", filename=cert_file.name)
             message.attach(image_part)
-            
+
             if self.use_ssl:
                 self._send_via_ssl(message)
             else:
                 self._send_via_standard(message)
-                
+
         except FileNotFoundError:
             raise
         except Exception as exc:
