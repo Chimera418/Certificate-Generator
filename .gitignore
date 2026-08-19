@@ -16,3 +16,9 @@ __pycache__/
 generated_certificates/
 events/
 misc/
+
+# Runtime logs from background jobs
+logs/
+
+# CSV chunks from `manage.py split-csv`
+splits/
