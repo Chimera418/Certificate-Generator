@@ -1,4 +1,5 @@
 import html
+import logging
 import os
 import re
 import smtplib
@@ -11,6 +12,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+LOGGER = logging.getLogger(__name__)
 
 # Only a bare {name} is a placeholder. Deliberately no support for dots, indexes,
 # conversions or format specs - see fill_placeholders().
@@ -99,12 +102,14 @@ class EmailSender:
             image_part.add_header("Content-Disposition", "attachment", filename=cert_file.name)
             message.attach(image_part)
 
+            LOGGER.debug("Email prepared for %s (subject: %s)", participant_email, message["Subject"])
+
             if self.use_ssl:
                 self._send_via_ssl(message)
             else:
                 self._send_via_standard(message)
 
-        except FileNotFoundError:
+        except (FileNotFoundError, RuntimeError):
             raise
         except Exception as exc:
             raise RuntimeError(f"Failed to prepare email for {participant_email}: {exc}") from exc
@@ -120,8 +125,12 @@ class EmailSender:
                     smtp.ehlo()
                 self._login_if_needed(smtp)
                 smtp.send_message(message)
-        except Exception as exc:
+        except smtplib.SMTPAuthenticationError as exc:
+            raise RuntimeError(f"SMTP authentication failed: {exc}") from exc
+        except smtplib.SMTPException as exc:
             raise RuntimeError(f"SMTP error: {exc}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"Network error: {exc}") from exc
 
     def _send_via_ssl(self, message: MIMEMultipart) -> None:
         context = ssl.create_default_context()
@@ -130,12 +139,17 @@ class EmailSender:
                 smtp.set_debuglevel(0)
                 self._login_if_needed(smtp)
                 smtp.send_message(message)
-        except Exception as exc:
+        except smtplib.SMTPAuthenticationError as exc:
+            raise RuntimeError(f"SMTP authentication failed: {exc}") from exc
+        except smtplib.SMTPException as exc:
             raise RuntimeError(f"SMTP error: {exc}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"Network error: {exc}") from exc
 
     def _login_if_needed(self, smtp: smtplib.SMTP) -> None:
-        if self.username and self.password:
+        if self.username:
             try:
                 smtp.login(self.username, self.password)
-            except Exception as exc:
+                LOGGER.debug("SMTP authentication successful for %s", self.username)
+            except smtplib.SMTPAuthenticationError as exc:
                 raise RuntimeError(f"Invalid SMTP credentials: {exc}") from exc
