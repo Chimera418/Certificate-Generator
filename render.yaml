@@ -32,7 +32,7 @@ services:
       - key: SUPABASE_SERVICE_KEY
         sync: false
       - key: SUPABASE_BUCKET
-        value: csi-aseb
+        value: certificate-templates
       # Postgres for clubs and events (Phase 1). When unset the app uses a
       # non-persistent in-memory store and says so loudly at startup - fine for a
       # throwaway preview, wrong for anything real. Run `python manage.py db-init`
