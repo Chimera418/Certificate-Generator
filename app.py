@@ -2007,7 +2007,7 @@ def _json_for_script(value) -> str:
 	"""json.dumps escaped so it is safe to embed inside a <script> block: a CSV cell
 	containing "</script>" or a lone "<" cannot break out of the tag."""
 	return (json.dumps(value)
-			.replace("<", "\u003c").replace(">", "\u003e").replace("&", "\u0026"))
+			.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
 
 
 def validate_fields_payload(slug: str, raw_fields, club_slug: str | None = None) -> tuple:

@@ -97,7 +97,16 @@ try:
     r.check("editor page renders", page.status_code == 200, page.status_code)
     r.check("editor injects the fields JSON", '"fields":' in body and "editor-data" in body)
     r.check("editor injects the columns", "position" in body and "team" in body)
-    r.check("a CSV cell cannot break out of the script block", "</script>" not in body.split("editor-data")[1].split("</script>")[0] or True)
+    # A CSV cell carrying a </script> breakout must be unicode-escaped inside the
+    # <script id="editor-data"> JSON block, never emitted as raw markup. The event
+    # carries the payload in a real cell value so it flows through sampleRows.
+    breakout = "</script><script>alert(1)</script>"
+    make_event("xss", "player,team,position\n" + breakout + ",Nimbus,1st\n")
+    xss_body = admin.get("/admin/events/xss/coordinates").data.decode("utf-8", "replace")
+    r.check("the raw </script> breakout payload never appears verbatim",
+            breakout not in xss_body)
+    r.check("the breakout payload is present but unicode-escaped",
+            "\\u003c/script\\u003e\\u003cscript\\u003e" in xss_body)
 
     # ── the route: save round-trips ──────────────────────────────────────────
     resp = admin.post(f"/admin/events/{slug}/fields",
