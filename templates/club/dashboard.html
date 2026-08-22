@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>{{ club.name }} &mdash; Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <header class="appbar">
+      <a href="{{ url_for('club_dashboard') }}" class="appbar__brand">
+        <span class="mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="9" r="5" /><path d="M9 13.5 8 21l4-2 4 2-1-7.5" /></svg>
+        </span>
+        Certificate Portal
+      </a>
+      <div class="appbar__spacer"></div>
+      <span class="appbar__meta"><b>{{ club.name }}</b></span>
+      <form action="{{ url_for('club_logout') }}" method="post" style="margin:0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <button type="submit" class="button-link secondary">Sign out</button>
+      </form>
+    </header>
+
+    <main class="wrap wrap--wide">
+      <div class="page-head">
+        <div class="page-head__text">
+          <h1>{{ club.name }}</h1>
+          <p class="sub addr-copy">
+            <span>Public page</span>
+            <code class="addr">/c/{{ club.slug }}</code>
+            <button type="button" class="copybtn" data-copy="{{ url_for('club_public', club_slug=club.slug) }}">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              <span class="copybtn__label">Copy</span>
+            </button>
+          </p>
+        </div>
+        <div class="page-head__actions">
+          <a href="{{ url_for('club_public', club_slug=club.slug) }}" class="button-link secondary" target="_blank" rel="noopener">View public page</a>
+        </div>
+      </div>
+
+      {% if pending %}
+      <div class="banner banner--warn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>
+        <span><b>Awaiting approval.</b> Set everything up now &mdash; your public page at
+          <code>/c/{{ club.slug }}</code> goes live once an administrator approves your club.</span>
+      </div>
+      {% endif %}
+
+      {% if error %}
+      <div class="banner banner--warn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 8v4M12 16h.01"/><circle cx="12" cy="12" r="9"/></svg>
+        <span>{{ error }}</span>
+      </div>
+      {% endif %}
+
+      <div class="panel">
+        <div class="panel__head">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
+          <h2>New event</h2>
+        </div>
+        <p class="panel__hint">Give the event a name and a short address. Each address is unique within your club and becomes its link at <code class="addr">/c/{{ club.slug }}/&lt;address&gt;</code>.</p>
+        <form action="{{ url_for('club_create_event') }}" method="post" class="form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <div class="input-pair">
+            <div>
+              <label class="field-label" for="name">Event name</label>
+              <input id="name" name="name" type="text" placeholder="Annual Hackathon 2026" required />
+            </div>
+            <div>
+              <label class="field-label" for="slug">Address</label>
+              <input id="slug" name="slug" type="text" placeholder="hackathon-2026"
+                     pattern="[a-z0-9][a-z0-9-]*" autocomplete="off" required />
+            </div>
+          </div>
+          <button type="submit">Create event</button>
+        </form>
+      </div>
+
+      <div class="section-head">
+        <div>
+          <h2>Events</h2>
+          <p class="count">{{ events|length }} event{{ '' if events|length == 1 else 's' }}
+            &middot; {{ active_count|default(0) }} published</p>
+        </div>
+        <div class="storage">
+          <span>{{ used_mb|default(0) }} / {{ quota_mb|default(0) }} MB</span>
+          <div class="meter"><div class="meter__fill {{ 'is-full' if used_pct|default(0) >= 90 else 'is-warn' if used_pct|default(0) >= 70 else '' }}"
+               style="width: {{ [used_pct|default(0), 3]|max if used_mb|default(0) else 0 }}%"></div></div>
+        </div>
+      </div>
+
+      {% if events %}
+      <div class="evmgr">
+        {% for event in events %}
+        <div class="evmgr__row">
+          <div class="evmgr__main">
+            <div class="evmgr__name">{{ event.name }}</div>
+            <div class="evmgr__meta">
+              <a class="evlink" href="{{ url_for('club_event_page', club_slug=club.slug, event_slug=event.slug) }}"
+                 target="_blank" rel="noopener">/c/{{ club.slug }}/{{ event.slug }}</a>
+              <button type="button" class="copybtn"
+                      data-copy="{{ url_for('club_event_page', club_slug=club.slug, event_slug=event.slug) }}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                <span class="copybtn__label">Copy</span>
+              </button>
+            </div>
+          </div>
+
+          {% if event.active %}
+          <span class="pill pill--live"><span class="dot"></span>Live</span>
+          {% else %}
+          <span class="pill pill--draft">Draft</span>
+          {% endif %}
+
+          <div class="evmgr__actions">
+            <a class="evact evact--primary" href="{{ url_for('club_event_detail', slug=event.slug) }}">Manage</a>
+            <form action="{{ url_for('club_toggle_event', slug=event.slug) }}" method="post" style="margin:0">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+              <input type="hidden" name="next" value="dashboard" />
+              <button type="submit" class="evact">{{ 'Unpublish' if event.active else 'Publish' }}</button>
+            </form>
+            <button type="button" class="evact evact--danger" onclick="toggleDel('{{ event.slug }}')">Delete</button>
+          </div>
+        </div>
+
+        <div id="del-{{ event.slug }}" class="evdel" hidden>
+          <form action="{{ url_for('club_delete_event', slug=event.slug) }}" method="post" class="evdel__form"
+                onsubmit="return confirm('Delete {{ event.slug }} and all its files? This cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <span class="evdel__label">Type <code>{{ event.slug }}</code> to permanently delete</span>
+            <input name="confirm" type="text" placeholder="{{ event.slug }}" autocomplete="off" />
+            <button type="submit" class="btn-danger">Delete</button>
+            <button type="button" class="button-link secondary" onclick="toggleDel('{{ event.slug }}')">Cancel</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>
+        <p>No events yet. Create one above to start issuing certificates.</p>
+      </div>
+      {% endif %}
+    </main>
+
+    <script>
+      function toggleDel(slug) {
+        const row = document.getElementById('del-' + slug);
+        if (!row) return;
+        row.hidden = !row.hidden;
+        if (!row.hidden) { const f = row.querySelector('input[name="confirm"]'); if (f) f.focus(); }
+      }
+      document.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-copy]');
+        if (!btn) return;
+        e.preventDefault();
+        const url = location.origin + btn.getAttribute('data-copy');
+        const label = btn.querySelector('.copybtn__label');
+        const done = () => {
+          btn.classList.add('is-ok');
+          if (label) label.textContent = 'Copied';
+          setTimeout(() => { btn.classList.remove('is-ok'); if (label) label.textContent = 'Copy'; }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(url).then(done).catch(() => {});
+        }
+      });
+    </script>
+  </body>
+</html>

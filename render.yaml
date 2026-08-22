@@ -3,7 +3,15 @@ services:
     name: certificate-generator
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --worker-class gthread --timeout 120 --access-logfile -
+    # Workers, not threads, are what scale JPEG. Pillow releases the GIL only in
+    # its file-descriptor encode path, and this app encodes to memory - on that
+    # path JPEG holds the GIL (measured 1.00x across 8 threads) while PNG's zlib
+    # encoder releases it (6.04x). Threads still help PNG events and I/O waits.
+    # Render sets WEB_CONCURRENCY from the instance's cores on paid plans.
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers ${WEB_CONCURRENCY:-1} --threads 4 --worker-class gthread --timeout 120 --access-logfile -
+    # The free plan cannot serve the 1000-participant target: a fraction of a CPU
+    # means multi-second waits and idle spin-down makes the first participant pay
+    # a cold start. See MULTI_TENANT_PLAN.md section 3. Upgrade in the dashboard.
     plan: free
     healthCheckPath: /healthz
     envVars:
@@ -25,6 +33,31 @@ services:
         sync: false
       - key: SUPABASE_BUCKET
         value: csi-aseb
+      # Postgres for clubs and events (Phase 1). When unset the app uses a
+      # non-persistent in-memory store and says so loudly at startup - fine for a
+      # throwaway preview, wrong for anything real. Run `python manage.py db-init`
+      # once against this URL to create the schema.
+      - key: DATABASE_URL
+        sync: false
+      # Render capacity — sized for the FREE plan (512 MB, ~0.1 shared CPU, 1 worker):
+      #   1 worker = ~100 MB interpreter+Pillow+Flask
+      #            +  48 MB template cache (TEMPLATE_CACHE_MAX_BYTES, ~2 A4 templates)
+      #            +  50 MB in-flight renders (2 slots x ~25 MB per copy)
+      #            = ~198 MB peak, comfortable headroom under 512 MB.
+      # Free cannot serve a spike regardless (0.1 CPU); this just keeps it from
+      # OOMing under the low, steady traffic it can handle. On idle spin-down the
+      # first visitor pays a cold start + a Supabase template fetch.
+      #
+      # PAID PROFILE — on upgrading (Starter 0.5 CPU / Standard 1 CPU, 2 GB), set:
+      #   WEB_CONCURRENCY = cores, TEMPLATE_CACHE_MAX_BYTES = "67108864" (64 MB),
+      #   RENDER_MAX_CONCURRENCY = "3", then VERIFY with
+      #   `python tests/load_render.py --concurrency 1` on the instance — not a spec sheet.
+      - key: TEMPLATE_CACHE_MAX_BYTES
+        value: "50331648"
+      - key: RENDER_MAX_CONCURRENCY
+        value: "2"
+      - key: RENDER_QUEUE_TIMEOUT_SEC
+        value: "30"
       # Upstash KV holds event configs. Participant lists moved to Supabase and
       # are only read from KV for events uploaded before that change.
       - key: KV_REST_API_URL

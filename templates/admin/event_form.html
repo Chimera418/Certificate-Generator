@@ -130,9 +130,16 @@
               <h3>Columns to match on</h3>
               {% if csv_columns is defined and csv_columns %}
               <p class="field-hint">Used only by the Custom fields mode.</p>
+              <p class="field-hint">
+                &ldquo;Show as a dropdown&rdquo; publishes every value in that column
+                to anyone who opens the event link. Fine for a short list like teams;
+                for names, emails, or roll numbers it publishes your whole roster.
+              </p>
               <div class="custom-columns-grid">
                 {% for col in csv_columns %}
-                <div class="custom-column-option">
+                {% set is_person = looks_person_level(col) %}
+                {% set is_drop = event and event.custom_dropdown_fields and (col in event.custom_dropdown_fields) %}
+                <div class="custom-column-option{{ ' is-person-level' if is_person else '' }}">
                   <label class="custom-column-main">
                     <input type="checkbox" name="custom_fields" value="{{ col }}"
                       {{ 'checked' if event and event.custom_fields and (col in event.custom_fields) else '' }} />
@@ -140,9 +147,16 @@
                   </label>
                   <label class="custom-column-dropdown">
                     <input type="checkbox" name="custom_dropdown_fields" value="{{ col }}"
-                      {{ 'checked' if event and event.custom_dropdown_fields and (col in event.custom_dropdown_fields) else '' }} />
-                    <span>Suggest values</span>
+                      data-person-level="{{ 'true' if is_person else 'false' }}"
+                      {{ 'checked' if is_drop else '' }} />
+                    <span>Show as a dropdown</span>
                   </label>
+                  {% if is_person %}
+                  <p class="roster-warning{{ ' is-active' if is_drop else '' }}" role="note">
+                    &#9888; Publishes every <strong>{{ col }}</strong> to anyone with the link.
+                    Leave this off unless the list is already public.
+                  </p>
+                  {% endif %}
                 </div>
                 {% endfor %}
               </div>
@@ -192,6 +206,27 @@
                       >{{ option.label }}</option>
                       {% endfor %}
                     </select>
+                  </div>
+                </div>
+
+                {% set selected_download_format = event.download_format if event and event.download_format else ('jpeg' if is_new else 'png') %}
+                <div class="input-pair">
+                  <div>
+                    <label for="download_format">Download format</label>
+                    <select id="download_format" name="download_format" class="coord-input">
+                      <option value="jpeg" {{ 'selected' if selected_download_format == 'jpeg' else '' }}>
+                        JPEG &mdash; recommended
+                      </option>
+                      <option value="png" {{ 'selected' if selected_download_format == 'png' else '' }}>
+                        PNG &mdash; high quality
+                      </option>
+                    </select>
+                    <p class="field-hint">
+                      JPEG renders about 9x faster and downloads about 3x smaller, which is
+                      what lets a large event serve everyone at once. Choose PNG only if this
+                      template has fine lines or thin text on a flat background. Templates
+                      with real transparency are always sent as PNG.
+                    </p>
                   </div>
                 </div>
 
@@ -593,5 +628,20 @@
       window.addEventListener('resize', redrawSmallPreview);
     </script>
     {% endif %}
+
+    <script>
+      // Runs on both the create and edit forms: light the roster warning the
+      // moment a person-level column is set to a dropdown, so the consequence is
+      // tied to the click, not buried in the panel text.
+      document.querySelectorAll('.custom-column-dropdown input[data-person-level="true"]')
+        .forEach((box) => {
+          const option = box.closest('.custom-column-option');
+          const warning = option ? option.querySelector('.roster-warning') : null;
+          if (!warning) return;
+          const sync = () => warning.classList.toggle('is-active', box.checked);
+          box.addEventListener('change', sync);
+          sync();
+        });
+    </script>
   </body>
 </html>

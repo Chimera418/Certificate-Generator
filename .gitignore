@@ -22,3 +22,6 @@ logs/
 
 # CSV chunks from `manage.py split-csv`
 splits/
+
+# Production data dumps from manage.py migrate-csi-aseb (never commit)
+backups/

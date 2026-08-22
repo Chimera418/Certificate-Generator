@@ -5,29 +5,51 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>Certificate Portal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
   </head>
   <body>
-    <main class="page">
-      <section class="card listing-card">
-        <h1>Certificate Portal</h1>
-        {% if events %}
-        <p class="listing-intro">Select your event to download your certificate.</p>
-        <ul class="event-list">
-          {% for event in events %}
-          <li>
-            <a class="event-link" href="{{ url_for('event_page', slug=event.slug) }}">
-              <span class="event-link-name">{{ event.name }}</span>
-              <span class="event-arrow" aria-hidden="true">&rarr;</span>
-            </a>
-          </li>
-          {% endfor %}
-        </ul>
-        {% else %}
-        <p class="listing-intro">No events are open right now. Check back later.</p>
-        {% endif %}
+    <header class="appbar">
+      <a href="{{ url_for('home') }}" class="appbar__brand">
+        <span class="mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="9" r="5" /><path d="M9 13.5 8 21l4-2 4 2-1-7.5" /></svg>
+        </span>
+        Certificate Portal
+      </a>
+      <div class="appbar__spacer"></div>
+      {% if club %}
+      <span class="appbar__meta"><b>{{ club.name }}</b></span>
+      <a href="{{ url_for('club_dashboard') }}" class="button-link secondary">Dashboard</a>
+      {% elif admin_logged_in %}
+      <a href="{{ url_for('admin_clubs') }}" class="button-link secondary">Admin</a>
+      {% else %}
+      <a href="{{ url_for('club_login') }}" class="appbar__link">Sign in</a>
+      <a href="{{ url_for('club_register') }}" class="button-link secondary">Register a club</a>
+      {% endif %}
+    </header>
+
+    <main class="wrap">
+      <section class="hero">
+        <h1>Issue certificates your participants can claim themselves.</h1>
+        <p class="lede">Upload a template, add your participant list, place the fields, and publish. Everyone
+          gets a personalized certificate at your club&rsquo;s own public link.</p>
+        <div class="hero__cta">
+          {% if club %}
+          <a href="{{ url_for('club_dashboard') }}" class="button-link">Go to your dashboard</a>
+          {% elif admin_logged_in %}
+          <a href="{{ url_for('admin_clubs') }}" class="button-link">Open admin</a>
+          {% else %}
+          <a href="{{ url_for('club_register') }}" class="button-link">Register your club</a>
+          <a href="{{ url_for('club_login') }}" class="button-link secondary">Sign in</a>
+          {% endif %}
+        </div>
       </section>
     </main>
-    <footer class="site-footer">Built by CSI</footer>
+
+    <footer class="site-foot">Built by CSI</footer>
   </body>
 </html>

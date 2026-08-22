@@ -182,6 +182,223 @@ def bulk_generate(slug: str, send_emails: bool = False, max_workers: int = 4,
     log_message(f"Completed! Successfully processed {success_count}/{len(rows)} participants.")
     log_message(f"Certificates exported to: {output_dir}")
 
+def db_init():
+    """Apply migrations/*.sql to the Postgres named by DATABASE_URL.
+
+    Re-runnable: every statement is IF NOT EXISTS, so pointing this at staging and
+    then production is safe. Refuses to run without DATABASE_URL rather than
+    silently doing nothing.
+    """
+    dsn = os.environ.get("DATABASE_URL", "").strip()
+    if not dsn:
+        raise SystemExit("DATABASE_URL is not set. db-init needs a Postgres connection string.")
+    try:
+        import psycopg
+    except ImportError:
+        raise SystemExit("psycopg is not installed. Run: pip install -r requirements.txt")
+
+    migrations_dir = Path(__file__).resolve().parent / "migrations"
+    files = sorted(migrations_dir.glob("*.sql"))
+    if not files:
+        raise SystemExit(f"No migration files found in {migrations_dir}.")
+
+    with psycopg.connect(dsn) as conn:
+        for path in files:
+            log_message(f"Applying {path.name} ...")
+            with conn.cursor() as cur:
+                cur.execute(path.read_text(encoding="utf-8"))
+            conn.commit()
+    log_message(f"db-init complete: applied {len(files)} migration file(s).")
+
+
+
+
+def _migration_plan():
+    """Read-only. What the csi-aseb migration would insert and move."""
+    from app import load_all_events, load_event, _supabase_list
+    import db
+
+    events_plan = []
+    for e in sorted(load_all_events(active_only=False), key=lambda e: e.get("slug", "")):
+        slug = e.get("slug")
+        if not slug:
+            continue
+        clean = db._clean_config(load_event(slug) or {})
+        events_plan.append({
+            "slug": slug,
+            "name": clean.get("name") or slug,
+            "active": bool(clean.get("active")),
+            "template_ext": clean.get("template_ext"),
+            "template_version": clean.get("template_version"),
+            "config": clean,
+        })
+
+    def list_prefix(prefix):
+        out, stack, seen = [], [prefix], set()
+        while stack:
+            pfx = stack.pop()
+            for entry in _supabase_list(pfx):
+                name = entry.get("name")
+                if not name:
+                    continue
+                full = pfx + name
+                meta = entry.get("metadata")
+                if meta and isinstance(meta, dict) and meta.get("size") is not None:
+                    out.append((full, int(meta["size"])))
+                else:
+                    child = full + "/"
+                    if child not in seen:
+                        seen.add(child)
+                        stack.append(child)
+        return sorted(out)
+
+    objects_plan = []
+    for ep in events_plan:
+        for path, size in list_prefix(ep["slug"] + "/"):
+            objects_plan.append({"src": path, "dest": "csi-aseb/" + path, "size": size})
+    return events_plan, objects_plan
+
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()
+
+
+def _content_type_for(path):
+    from app import TEMPLATE_CONTENT_TYPES, PARTICIPANT_CONTENT_TYPES
+    import os as _os
+    ext = _os.path.splitext(path)[1].lower()
+    return (TEMPLATE_CONTENT_TYPES.get(ext)
+            or PARTICIPANT_CONTENT_TYPES.get(ext)
+            or "application/octet-stream")
+
+
+def migrate_csi_aseb(dry_run):
+    """Migrate the legacy csi-aseb data into the first club row. Re-runnable.
+
+    Ordering note: objects are COPIED and verified to the new csi-aseb/ prefix
+    BEFORE the club/events rows are inserted, and the legacy sources are deleted
+    only AFTER. Inserting the rows first would flip resolve_public_event onto the
+    club-scoped storage path before the objects exist there, breaking renders of
+    the live 'think-run-debug' event mid-migration. Copy-first keeps both paths
+    serving throughout the cutover, and 'copy, verify, then delete - never move'
+    is what makes a re-run safe.
+    """
+    # Refuse without a real Postgres. Without this, repo() is the in-memory store:
+    # the object COPY/DELETE below would still hit the real bucket while the club
+    # and event rows land in a throwaway DB that vanishes on exit - leaving the
+    # bucket migrated but no rows, so every csi-aseb event becomes unreachable.
+    if not os.environ.get("DATABASE_URL", "").strip():
+        raise SystemExit("DATABASE_URL is not set. migrate-csi-aseb needs the real "
+                         "Postgres, or it would move bucket objects while writing rows "
+                         "to a throwaway in-memory store. Aborting.")
+
+    from app import (LEGACY_TOKEN_CLUB, repo, generate_password_hash,
+                     _supabase_download, _supabase_upload, _supabase_delete)
+    import db
+    if repo().backend_name != "postgres":
+        raise SystemExit(f"Repository backend is {repo().backend_name!r}, not Postgres. Aborting.")
+
+    def _dl(path):
+        # Missing objects can come back as 400 or 404 depending on Supabase;
+        # for migration purposes any read failure means 'not readable at that
+        # path'. The verify-after-copy step below is what actually guards data.
+        from urllib import error as _e
+        try:
+            return _supabase_download(path)
+        except (_e.HTTPError, _e.URLError, TimeoutError, OSError, ValueError):
+            return None
+
+    club_slug = LEGACY_TOKEN_CLUB  # "csi-aseb"
+    events_plan, objects_plan = _migration_plan()
+
+    log_message("=== csi-aseb migration " + ("(DRY RUN - changes nothing)" if dry_run else "(EXECUTE)") + " ===")
+    log_message(f"club row: slug={club_slug!r}, name='CSI ASEB', status='approved'")
+    log_message(f"events to insert: {len(events_plan)}")
+    for ep in events_plan:
+        log_message(f"  - {ep['slug']}: active={ep['active']}, ext={ep['template_ext']}, "
+                    f"ver={str(ep['template_version'])[:12]}, config_keys={sorted(ep['config'].keys())}")
+    log_message(f"objects to copy -> verify -> delete: {len(objects_plan)}")
+    for ob in objects_plan:
+        dest_present = _dl(ob["dest"]) is not None
+        note = "  [dest already present - would verify & skip]" if dest_present else ""
+        log_message(f"  - {ob['src']}  ->  {ob['dest']}  ({ob['size']} b){note}")
+
+    if dry_run:
+        log_message("DRY RUN complete. Nothing was changed. Re-run with --execute to apply.")
+        return
+
+    # ── EXECUTE ──────────────────────────────────────────────────────────────
+    # 1. Export/backup FIRST (this file IS the backup - Supabase PITR is paid).
+    import datetime, json as _json, os as _os
+    from app import load_event, _supabase_list
+    backups = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "backups")
+    _os.makedirs(backups, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    export_path = _os.path.join(backups, f"csi-aseb-migration-{stamp}.json")
+    export = {
+        "created_at": datetime.datetime.now().isoformat(),
+        "kv_configs": {ep["slug"]: load_event(ep["slug"]) for ep in events_plan},
+        "bucket_objects": [{"path": ob["src"], "size": ob["size"]} for ob in objects_plan],
+        "plan": {"club": club_slug, "events": [ep["slug"] for ep in events_plan]},
+    }
+    with open(export_path, "w", encoding="utf-8") as f:
+        _json.dump(export, f, indent=2)
+    log_message(f"backup written: {export_path}")
+
+    # 2. Copy + verify every object (do NOT delete the source yet).
+    for ob in objects_plan:
+        src, dest = ob["src"], ob["dest"]
+        dest_bytes = _dl(dest)
+        src_bytes = _dl(src)
+        if dest_bytes is not None and (src_bytes is None or _sha(dest_bytes) == _sha(src_bytes)):
+            log_message(f"copy: {dest} already present and verified - skip")
+            continue
+        if src_bytes is None:
+            raise SystemExit(f"ABORT: source {src} missing and dest not present - cannot migrate.")
+        _supabase_upload(dest, src_bytes, _content_type_for(dest))
+        check = _dl(dest)
+        if check is None or _sha(check) != _sha(src_bytes):
+            raise SystemExit(f"ABORT: verify failed for {dest} - source left intact.")
+        log_message(f"copy+verify: {src} -> {dest} ({len(src_bytes)} b)")
+
+    # 3. Insert the club row, then the events rows (cutover - objects already there).
+    club = repo().get_club_by_slug(club_slug)
+    if club is None:
+        club = repo().create_club(club_slug, "CSI ASEB",
+                                  generate_password_hash(_os.urandom(24).hex()))
+        log_message(f"inserted club row {club_slug} (login password unusable - set via superadmin if needed)")
+    else:
+        log_message(f"club row {club_slug} already exists - reusing")
+    repo().set_club_status(club["id"], "approved")
+
+    for ep in events_plan:
+        existing = repo().get_event(club["id"], ep["slug"])
+        if existing is None:
+            repo().create_event(club["id"], ep["slug"], ep["name"], ep["config"])
+            log_message(f"inserted event row {club_slug}/{ep['slug']}")
+        else:
+            log_message(f"event row {club_slug}/{ep['slug']} already exists - updating")
+        repo().update_event(club["id"], ep["slug"], name=ep["name"], config=ep["config"],
+                            active=ep["active"], template_ext=ep["template_ext"],
+                            template_version=ep["template_version"])
+
+    # 4. Delete the legacy sources - only those whose dest is verified present.
+    for ob in objects_plan:
+        src, dest = ob["src"], ob["dest"]
+        dest_bytes = _dl(dest)
+        src_bytes = _dl(src)
+        if src_bytes is None:
+            log_message(f"delete: source {src} already gone")
+            continue
+        if dest_bytes is not None and _sha(dest_bytes) == _sha(src_bytes):
+            _supabase_delete(src)
+            log_message(f"delete: removed legacy source {src} (verified at {dest})")
+        else:
+            log_message(f"KEEP: {src} not verified at dest - source left intact")
+
+    log_message("=== migration complete. Bridges left in place (per plan S9). ===")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Certificate Generator Management CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -202,6 +419,15 @@ if __name__ == "__main__":
     parser_email.add_argument("slug", help="Event slug")
     parser_email.add_argument("--workers", type=int, default=4, help="Max concurrent workers")
 
+    # db-init
+    subparsers.add_parser("db-init", help="Create the clubs/events schema in the DATABASE_URL Postgres")
+
+    # migrate-csi-aseb
+    p_mig = subparsers.add_parser("migrate-csi-aseb", help="Migrate the legacy csi-aseb data into the first club row")
+    mig_mode = p_mig.add_mutually_exclusive_group(required=True)
+    mig_mode.add_argument("--dry-run", action="store_true", help="Print the plan, change nothing")
+    mig_mode.add_argument("--execute", action="store_true", help="Apply the migration")
+
     args = parser.parse_args()
 
     if args.command == "split-csv":
@@ -210,3 +436,7 @@ if __name__ == "__main__":
         bulk_generate(args.slug, send_emails=False, max_workers=args.workers)
     elif args.command == "send-emails":
         bulk_generate(args.slug, send_emails=True, max_workers=args.workers)
+    elif args.command == "db-init":
+        db_init()
+    elif args.command == "migrate-csi-aseb":
+        migrate_csi_aseb(dry_run=args.dry_run)

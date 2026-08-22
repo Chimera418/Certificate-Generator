@@ -55,6 +55,13 @@ try:
     r.check("config records a version", bool(config_after.get("template_version")))
     r.check("version changed", config_after.get("template_version") != version_before,
             (version_before, config_after.get("template_version")))
+
+    # The upload pre-decodes the template into the image cache (from the bytes it
+    # already holds), so the first certificate render skips the fetch + decode. This
+    # asserts it is warm before any render forces a decode.
+    warmed_key = A._template_cache_key(TEST_SLUG, config_after.get("template_version"))
+    r.check("upload pre-warms the decoded-template cache",
+            A._TEMPLATE_IMAGE_CACHE.get(warmed_key) is not None)
     r.check("config cache hands out copies, not shared references",
             A.load_event(TEST_SLUG) is not config)
 
