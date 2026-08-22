@@ -5,382 +5,683 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>Placement &mdash; {{ event.name }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+    <style>
+      :root {
+        --ink: #000; --panel: #0a0a0a; --panel-2: #101010; --panel-3: #161616;
+        --rule: #1f1f1f; --rule-hot: #2e2e2e;
+        --text: #ededed; --muted: #a1a1a1; --faint: #86868e;
+        --ok: #3fb950; --warn: #d29922; --warn-bg: rgba(210,153,34,.11);
+        --danger: #f85149; --danger-bg: rgba(248,81,73,.10);
+        --ui: "Archivo", ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+        --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+        --r-sm: 6px; --dur: 140ms; --ease: cubic-bezier(.2,0,0,1);
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--ink); color: var(--text);
+        font-family: var(--ui); font-size: 14px; line-height: 1.45; -webkit-font-smoothing: antialiased; }
+      .shell { display: grid; grid-template-columns: minmax(0,1fr) 428px; height: 100vh; min-height: 640px; }
+      @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; height: auto; } }
+
+      .stage { position: relative; display: flex; flex-direction: column; min-width: 0;
+        border-right: 1px solid var(--rule);
+        background: radial-gradient(120% 90% at 50% 0%, #0d0d0d 0%, #000 62%); }
+      .stage-bar { display: flex; align-items: center; gap: 14px; padding: 0 18px; height: 52px;
+        flex: 0 0 52px; border-bottom: 1px solid var(--rule); background: rgba(0,0,0,.6); }
+      .back-btn { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 13px 0 10px;
+        border: 1px solid var(--rule-hot); border-radius: var(--r-sm); background: var(--panel-2); color: var(--muted);
+        font-family: var(--ui); font-size: 13px; font-weight: 500; text-decoration: none; white-space: nowrap; flex: 0 0 auto;
+        transition: color var(--dur) var(--ease), background var(--dur) var(--ease), border-color var(--dur) var(--ease); }
+      .back-btn:hover { color: var(--text); background: var(--panel-3); border-color: var(--faint); }
+      .back-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+      .back-btn svg { width: 14px; height: 14px; }
+      .crumb { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .crumb b { color: var(--text); font-weight: 600; }
+      .crumb a { color: var(--faint); text-decoration: none; }
+      .crumb a:hover { color: var(--text); }
+      .stage-bar .spacer { flex: 1; }
+      .dims { font-family: var(--mono); font-size: 11px; color: var(--faint); letter-spacing: .02em;
+        font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .save-state { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--faint); white-space: nowrap; }
+      .save-state .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); transition: background var(--dur) var(--ease); }
+      .save-state[data-state="dirty"] { color: var(--warn); } .save-state[data-state="dirty"] .dot { background: var(--warn); }
+      .save-state[data-state="saving"] { color: var(--muted); } .save-state[data-state="saving"] .dot { background: var(--muted); }
+      .save-state[data-state="saved"] { color: var(--ok); } .save-state[data-state="saved"] .dot { background: var(--ok); }
+      .save-state[data-state="error"] { color: var(--danger); } .save-state[data-state="error"] .dot { background: var(--danger); }
+
+      .canvas-wrap { position: relative; flex: 1 1 auto; min-height: 420px; overflow: hidden; }
+      canvas#stage { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: default; }
+      canvas#stage.is-over { cursor: grab; } canvas#stage.is-dragging { cursor: grabbing; }
+      .readout { position: absolute; z-index: 4; pointer-events: none; padding: 5px 8px; border-radius: var(--r-sm);
+        background: rgba(0,0,0,.9); border: 1px solid var(--rule-hot); font-family: var(--mono); font-size: 11px;
+        letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; opacity: 0;
+        transform: translate(-50%,-160%); transition: opacity 90ms linear; }
+      .readout.on { opacity: 1; } .readout .k { color: var(--faint); }
+      .stage-foot { display: flex; align-items: center; gap: 16px; flex: 0 0 auto; padding: 9px 18px;
+        border-top: 1px solid var(--rule); background: rgba(0,0,0,.6); font-size: 12px; color: var(--faint); flex-wrap: wrap; }
+      kbd { font-family: var(--mono); font-size: 10.5px; padding: 2px 5px; border: 1px solid var(--rule-hot);
+        border-bottom-width: 2px; border-radius: 4px; background: var(--panel-2); color: var(--muted); }
+
+      .rail { display: flex; flex-direction: column; min-width: 0; background: var(--panel); overflow: hidden; }
+      .rail-head { display: flex; align-items: baseline; gap: 10px; padding: 18px 22px 14px; border-bottom: 1px solid var(--rule); }
+      .rail-head h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+      .count { font-family: var(--mono); font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+      .count.at-cap { color: var(--warn); }
+
+      /* Sized to show every field (max 5) without an inner scroll on normal screens;
+         only a short viewport forces it to scroll. The inspector below absorbs the rest. */
+      .fields { list-style: none; margin: 0; padding: 12px; display: flex; flex-direction: column; gap: 7px;
+        flex: 0 1 auto; max-height: min(440px, 56vh); overflow-y: auto; border-bottom: 1px solid var(--rule); }
+      @media (max-width: 1080px) { .fields { max-height: none; } }
+      .field-row { --hue: #e8b339; position: relative; display: grid; grid-template-columns: 14px 1fr auto auto;
+        align-items: center; gap: 10px; padding: 12px 11px 12px 0; border: 1px solid transparent; border-radius: var(--r-sm);
+        background: var(--panel-2); cursor: pointer; transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease); }
+      .field-row:hover { background: var(--panel-3); }
+      .field-row.sel { background: var(--panel-3); border-color: var(--rule-hot); }
+      .field-row.dragging { opacity: .4; }
+      .field-row.drop-before { box-shadow: inset 0 2px 0 var(--hue); } .field-row.drop-after { box-shadow: inset 0 -2px 0 var(--hue); }
+      .spine { align-self: stretch; width: 3px; margin-left: 6px; border-radius: 2px; background: var(--hue); opacity: .5; transition: opacity var(--dur) var(--ease); }
+      .field-row.sel .spine { opacity: 1; }
+      .f-main { min-width: 0; } .f-label { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .f-sub { font-family: var(--mono); font-size: 10.5px; color: var(--faint); white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+      .src { font-family: var(--mono); font-size: 9.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
+        padding: 3px 6px; border-radius: 4px; white-space: nowrap; border: 1px solid; }
+      .src[data-s="input"] { color: var(--warn); border-color: rgba(210,153,34,.4); background: var(--warn-bg); }
+      .src[data-s="csv"] { color: #9fd4dd; border-color: rgba(76,195,212,.3); background: rgba(76,195,212,.09); }
+      .src[data-s="static"] { color: var(--muted); border-color: var(--rule-hot); background: var(--panel-3); }
+      .icon-btn { display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid transparent;
+        border-radius: var(--r-sm); background: none; color: var(--faint); cursor: pointer;
+        transition: color var(--dur) var(--ease), background var(--dur) var(--ease), border-color var(--dur) var(--ease); }
+      .icon-btn:hover { color: var(--danger); background: var(--danger-bg); border-color: rgba(248,81,73,.3); }
+      .icon-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; } .icon-btn svg { width: 13px; height: 13px; }
+      .grip { cursor: grab; color: var(--rule-hot); display: grid; place-items: center; width: 16px; }
+      .grip:active { cursor: grabbing; } .grip svg { width: 11px; height: 11px; }
+      .add-row { padding: 8px; border-bottom: 1px solid var(--rule); }
+      .add-btn { width: 100%; height: 38px; border: 1px dashed var(--rule-hot); border-radius: var(--r-sm); background: none;
+        color: var(--muted); font-family: var(--ui); font-size: 13px; font-weight: 500; cursor: pointer;
+        transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+      .add-btn:hover:not(:disabled) { color: var(--text); border-color: var(--faint); background: var(--panel-2); }
+      .add-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+      .add-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+      .inspector { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+
+      .rail-foot { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 13px 22px;
+        border-top: 1px solid var(--rule); background: var(--panel-2); }
+      .rail-foot .save-state { margin-right: auto; }
+      .save-btn { flex: 0 0 auto; height: 40px; padding: 0 26px; border: 1px solid rgba(63,185,80,.5);
+        border-radius: var(--r-sm); background: rgba(63,185,80,.14); color: #7ee29a; font-family: var(--ui);
+        font-size: 13px; font-weight: 600; cursor: pointer;
+        transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease); }
+      .save-btn:hover:not(:disabled) { background: rgba(63,185,80,.24); border-color: var(--ok); color: #a7ecb9; }
+      .save-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+      .save-btn:disabled { opacity: .55; cursor: default; }
+      .insp-head { position: sticky; top: 0; z-index: 2; --hue: #e8b339; display: flex; align-items: center; gap: 10px;
+        padding: 13px 18px; background: var(--panel-2); border-bottom: 1px solid var(--rule); box-shadow: inset 3px 0 0 var(--hue); }
+      .insp-head .n { font-family: var(--mono); font-size: 11px; color: var(--hue); font-weight: 600; }
+      .insp-head h3 { margin: 0; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .group { padding: 18px 22px; border-bottom: 1px solid var(--rule); }
+      .group > .gt { margin: 0 0 14px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+      .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+      /* Collapsible inspector sections. The header toggles its body; state persists
+         across field switches so a folded section stays folded. */
+      .ig { border-bottom: 1px solid var(--rule); }
+      .ig__head { width: 100%; display: flex; align-items: center; gap: 10px; padding: 15px 22px; text-align: left;
+        background: none; border: none; cursor: pointer; color: var(--faint);
+        transition: color var(--dur) var(--ease); }
+      .ig__head:hover { color: var(--text); }
+      .ig__head:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; }
+      .ig__t { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; font-family: var(--ui); }
+      .ig__chev { width: 14px; height: 14px; margin-left: auto; color: var(--rule-hot); flex: 0 0 auto;
+        transition: transform var(--dur) var(--ease), color var(--dur) var(--ease); }
+      .ig__head:hover .ig__chev { color: var(--faint); }
+      .ig.is-collapsed .ig__chev { transform: rotate(-90deg); }
+      .ig__body { padding: 0 22px 18px; }
+      .ig.is-collapsed .ig__body { display: none; }
+      .ctl { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+      .ctl > label { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); font-weight: 500; }
+      input[type="text"], input[type="number"], select { width: 100%; height: 36px; padding: 0 9px; border: 1px solid var(--rule-hot);
+        border-radius: var(--r-sm); background: var(--ink); color: var(--text); font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums;
+        transition: border-color var(--dur) var(--ease); }
+      select { font-family: var(--ui); font-size: 13px; cursor: pointer; }
+      input:focus, select:focus { outline: none; border-color: var(--faint); }
+      input:focus-visible, select:focus-visible { outline: 2px solid var(--text); outline-offset: -1px; }
+      input[type="color"] { width: 100%; height: 36px; padding: 3px; border: 1px solid var(--rule-hot); border-radius: var(--r-sm); background: var(--ink); cursor: pointer; }
+      .seg { display: grid; grid-template-columns: repeat(3,1fr); border: 1px solid var(--rule-hot); border-radius: var(--r-sm); overflow: hidden; }
+      .seg button { height: 36px; border: none; background: var(--ink); color: var(--faint); font-family: var(--mono); font-size: 10.5px;
+        font-weight: 600; letter-spacing: .08em; text-transform: uppercase; cursor: pointer; border-right: 1px solid var(--rule-hot);
+        transition: color var(--dur) var(--ease), background var(--dur) var(--ease); }
+      .seg button:last-child { border-right: none; }
+      .seg button:hover { color: var(--text); background: var(--panel-2); }
+      .seg button:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; }
+      .seg button[aria-pressed="true"] { background: var(--panel-3); color: var(--text); }
+      .seg button[aria-pressed="true"][data-s="input"] { color: var(--warn); box-shadow: inset 0 -2px 0 var(--warn); }
+      .seg button[aria-pressed="true"][data-s="csv"] { color: #9fd4dd; box-shadow: inset 0 -2px 0 #4cc3d4; }
+      .seg button[aria-pressed="true"][data-s="static"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--faint); }
+      .seg button:disabled { opacity: .35; cursor: not-allowed; }
+      .note { display: flex; gap: 9px; margin-top: 11px; padding: 10px 11px; border-radius: var(--r-sm); font-size: 12px; line-height: 1.5;
+        border: 1px solid var(--rule-hot); background: var(--panel-2); color: var(--muted); }
+      .note svg { width: 14px; height: 14px; flex: 0 0 14px; margin-top: 2px; }
+      .note.warn { border-color: rgba(210,153,34,.35); background: var(--warn-bg); color: #e6c674; } .note.warn svg { color: var(--warn); }
+      .note b { color: var(--text); font-weight: 600; } .note code { font-family: var(--mono); font-size: 11px; color: var(--text); }
+      .empty { padding: 40px 24px; text-align: center; color: var(--faint); font-size: 13px; line-height: 1.6; }
+      .hint { font-size: 11.5px; color: var(--faint); line-height: 1.5; margin: 7px 0 0; }
+      .hint code { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+      /* Slim, quiet scrollbars - the OS default arrow buttons crowded the rail. */
+      .fields, .inspector { scrollbar-width: thin; scrollbar-color: var(--rule-hot) transparent; }
+      .fields::-webkit-scrollbar, .inspector::-webkit-scrollbar { width: 11px; }
+      .fields::-webkit-scrollbar-track, .inspector::-webkit-scrollbar-track { background: transparent; }
+      .fields::-webkit-scrollbar-thumb, .inspector::-webkit-scrollbar-thumb {
+        background: var(--rule-hot); border-radius: 999px; border: 3px solid var(--panel); background-clip: padding-box; }
+      .fields::-webkit-scrollbar-thumb:hover, .inspector::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+      @media (prefers-reduced-motion: reduce) { * { transition-duration: 0ms !important; } }
+    </style>
   </head>
   <body>
-    <div class="coord-editor-layout">
-      <div class="coord-editor-canvas">
-        <canvas id="certEditorCanvas"></canvas>
-      </div>
+    <script type="application/json" id="editor-data">
+      {
+        "fields": {{ fields_json | safe }},
+        "columns": {{ columns_json | safe }},
+        "sampleRows": {{ sample_rows_json | safe }},
+        "fonts": {{ fonts_json | safe }},
+        "maxFields": {{ max_fields }},
+        "hasCsv": {{ 'true' if has_csv else 'false' }},
+        "slug": "{{ event.slug }}",
+        "templateUrl": "{{ template_url }}",
+        "saveUrl": "{{ save_url }}",
+        "backUrl": "{{ back_url }}",
+        "csrf": "{{ csrf_token() }}"
+      }
+    </script>
 
-      <div class="coord-editor-panel">
-        <h3>Position</h3>
-        <p class="admin-subtitle" id="coordSaveStatus">Changes save automatically.</p>
+    <div class="shell">
+      <section class="stage">
+        <div class="stage-bar">
+          <a class="back-btn" href="{{ back_url }}" title="Back to the event">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>Back</a>
+          <div class="crumb"><a href="{{ back_url }}">{{ event.name }}</a>
+            <span style="color: var(--rule-hot)">/</span> <b>Field placement</b></div>
+          <div class="spacer"></div>
+          <div class="dims" id="dims">&mdash;</div>
+        </div>
+        <div class="canvas-wrap" id="wrap">
+          <canvas id="stage"></canvas>
+          <div class="readout" id="readout"></div>
+        </div>
+        <div class="stage-foot">
+          <span><kbd>click</kbd> select</span>
+          <span><kbd>drag</kbd> move</span>
+          <span><kbd>&larr;&uarr;&darr;&rarr;</kbd> nudge</span>
+          <span><kbd>shift</kbd> + arrows 10px</span>
+          <span><kbd>tab</kbd> next</span>
+          <span><kbd>del</kbd> remove</span>
+        </div>
+      </section>
 
-        <form id="editorForm" method="post"
-              action="{{ url_for('admin_update_config', slug=event.slug) }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-
-          <div class="coord-row">
-            <div class="coord-editor-control">
-              <label for="text_x">X</label>
-              <input id="text_x" name="text_x" class="coord-input" type="number" min="0"
-                     value="{{ event.text_x if event else 1789 }}" />
-            </div>
-            <div class="coord-editor-control">
-              <label for="text_y">Y</label>
-              <input id="text_y" name="text_y" class="coord-input" type="number" min="0"
-                     value="{{ event.text_y if event else 1440 }}" />
-            </div>
-          </div>
-
-          <h3>Type</h3>
-
-          <div class="coord-row">
-            <div class="coord-editor-control">
-              <label for="font_size">Size</label>
-              <input id="font_size" name="font_size" class="coord-input" type="number" min="8"
-                     value="{{ event.font_size if event else 100 }}" />
-            </div>
-            <div class="coord-editor-control">
-              <label for="font_color">Colour</label>
-              {% if event and event.font_color %}
-                {% set fc = event.font_color %}
-                <input id="font_color" name="font_color" type="color"
-                       value="#{{ '%02x%02x%02x' % (fc[0], fc[1], fc[2]) }}" />
-              {% else %}
-                <input id="font_color" name="font_color" type="color" value="#321812" />
-              {% endif %}
-            </div>
-          </div>
-
-          {% set selected_font_key = event.font_key if event and event.font_key else default_font_key %}
-          <div class="coord-editor-control">
-            <label for="font_key">Typeface</label>
-            <select id="font_key" name="font_key">
-              {% for option in font_options %}
-              <option
-                value="{{ option.key }}"
-                data-family="{{ option.css_family }}"
-                data-weight="{{ option.css_weight }}"
-                data-url="{{ url_for('font_asset', font_key=option.key) }}"
-                {{ 'selected' if option.key == selected_font_key else '' }}
-              >{{ option.label }}</option>
-              {% endfor %}
-            </select>
-          </div>
-
-          <h3>Preview</h3>
-
-          <div class="coord-editor-control">
-            <label for="sample_text">Sample text</label>
-            <input id="sample_text" type="text" value="Sample Text"
-                   placeholder="Sample Text" autocomplete="off" />
-          </div>
-
-          <p class="coord-info">
-            <strong>Tip.</strong> Drag the marker on the certificate to move the name,
-            or type exact coordinates above.
-          </p>
-
-          <div class="coord-editor-actions">
-            <button type="button" id="saveEditorButton" class="coord-editor-btn">Save changes</button>
-            <a href="{{ url_for('admin_edit_event', slug=event.slug) }}"
-               class="button-link secondary coord-editor-btn">Back to event</a>
-          </div>
-        </form>
-      </div>
+      <aside class="rail">
+        <div class="rail-head"><h2>Fields</h2><span class="count" id="count">0 / 5</span></div>
+        <ul class="fields" id="list"></ul>
+        <div class="add-row"><button class="add-btn" id="add">Add field</button></div>
+        <div class="inspector" id="inspector"></div>
+        <div class="rail-foot">
+          <div class="save-state" id="saveState" data-state="idle"><span class="dot"></span><span id="saveText">No changes</span></div>
+          <button class="save-btn" id="saveBtn" type="button">Save</button>
+        </div>
+      </aside>
     </div>
 
     <script>
-      const canvas = document.getElementById('certEditorCanvas');
-      const ctx = canvas.getContext('2d');
-      const form = document.getElementById('editorForm');
+      "use strict";
+      const DATA = JSON.parse(document.getElementById("editor-data").textContent);
+      const MAX_FIELDS = DATA.maxFields;
+      const HUES = ["#e8b339", "#4cc3d4", "#e4707f", "#93c34a", "#a48ae0"];
+      const FONTS = DATA.fonts;                       // [{key,label,family,weight,url}]
+      const FONT_BY_KEY = Object.fromEntries(FONTS.map((f) => [f.key, f]));
+      const DEFAULT_FONT = (FONTS[0] || { key: "montserrat_bold" }).key;
+      const COLUMNS = DATA.columns;
+      const SAMPLE_ROWS = DATA.sampleRows;
+      const PERSON_HINTS = ["name", "email", "mail", "phone", "mobile", "roll", "reg", "id",
+        "player", "student", "participant", "member", "user", "person", "usn", "prn"];
 
-      const textXInput = document.getElementById('text_x');
-      const textYInput = document.getElementById('text_y');
-      const fontSizeInput = document.getElementById('font_size');
-      const fontKeyInput = document.getElementById('font_key');
-      const fontColorInput = document.getElementById('font_color');
-      const sampleTextInput = document.getElementById('sample_text');
-      const coordSaveStatus = document.getElementById('coordSaveStatus');
-      const saveEditorButton = document.getElementById('saveEditorButton');
-      const templatePreviewUrl = "{{ url_for('admin_template_preview', slug=event.slug) }}";
-      const sampleTextStorageKey = 'coord-editor-sample-text:{{ event.slug }}';
+      // ── colour helpers: fields carry [r,g,b]; the colour input wants #rrggbb ──
+      const rgbToHex = (c) => "#" + (c || [50, 34, 24]).slice(0, 3)
+        .map((n) => Math.max(0, Math.min(255, n | 0)).toString(16).padStart(2, "0")).join("");
+      const hexToRgb = (h) => { const m = /^#?([0-9a-f]{6})$/i.exec(h || ""); if (!m) return [50, 34, 24];
+        const v = m[1]; return [parseInt(v.slice(0, 2), 16), parseInt(v.slice(2, 4), 16), parseInt(v.slice(4, 6), 16)]; };
 
-      let certImage = null;
-      let maxCanvasWidth = 0;
-      let maxCanvasHeight = 0;
-      let scaleX = 1;
-      let scaleY = 1;
-      let isDragging = false;
-      let dragOffsetX = 0;
-      let dragOffsetY = 0;
-      let coordAutosaveTimer = null;
-      let coordAutosaveInFlight = false;
-      let coordAutosaveQueued = false;
-      const loadedPreviewFonts = new Set();
-
-      function selectedPreviewFont() {
-        const selected = fontKeyInput && fontKeyInput.selectedOptions
-          ? fontKeyInput.selectedOptions[0]
-          : null;
+      // Editor-local field: server [r,g,b] becomes a hex string for the colour input.
+      function fromServer(f, i) {
         return {
-          family: (selected && selected.dataset.family) || 'Montserrat Bold',
-          weight: (selected && selected.dataset.weight) || '700',
-          url: (selected && selected.dataset.url) || ''
+          id: f.id || ("field_" + (i + 1)), label: f.label || f.id || ("Field " + (i + 1)),
+          source: f.source || "input", column: f.column || "", value: f.value || "",
+          x: f.x | 0, y: f.y | 0, font_size: f.font_size || 100, font_color: rgbToHex(f.font_color),
+          font_key: FONT_BY_KEY[f.font_key] ? f.font_key : DEFAULT_FONT,
+          align: f.align || "center", max_width: f.max_width || null,
+          overflow: f.overflow || "shrink", depends_on: f.depends_on || null,
+        };
+      }
+      function toServer(f) {
+        return {
+          id: f.id, label: f.label, source: f.source,
+          column: f.source === "csv" ? f.column : "", value: f.source === "static" ? f.value : "",
+          x: Math.round(f.x), y: Math.round(f.y), font_size: Math.round(f.font_size),
+          font_color: hexToRgb(f.font_color), font_key: f.font_key, align: f.align,
+          max_width: f.max_width ? Math.round(f.max_width) : null, overflow: f.overflow,
+          depends_on: f.depends_on || null,
         };
       }
 
-      function ensurePreviewFontLoaded() {
-        const font = selectedPreviewFont();
-        if (!document.fonts) return Promise.resolve();
-        if (loadedPreviewFonts.has(font.family)) {
-          return document.fonts.load(`${font.weight} 32px "${font.family}"`).catch(() => undefined);
-        }
-        if (window.FontFace && font.url) {
-          const face = new FontFace(font.family, `url(${font.url})`, { weight: font.weight });
-          return face.load().then((loaded) => {
-            document.fonts.add(loaded);
-            loadedPreviewFonts.add(font.family);
-            return document.fonts.load(`${font.weight} 32px "${font.family}"`);
-          }).catch(() => undefined);
-        }
-        return document.fonts.load(`${font.weight} 32px "${font.family}"`).catch(() => undefined);
+      let fields = (DATA.fields || []).map(fromServer);
+      if (!fields.length) fields = [fromServer({ id: "name", label: "Name", source: "input", x: 0, y: 0 }, 0)];
+      let selected = 0;
+      let sampleRow = 0;
+      // Which inspector sections are folded. Global (persists as you switch fields),
+      // so a section you collapse stays collapsed. Toggled by its header.
+      const groupCollapsed = { where: false, label: true, place: false, type: false, preview: true };
+      function grp(key, title, body) {
+        const col = groupCollapsed[key] ? " is-collapsed" : "";
+        return '<section class="ig' + col + '" data-g="' + key + '">' +
+          '<button type="button" class="ig__head" data-gtoggle="' + key + '"><span class="ig__t">' + title + '</span>' +
+          '<svg class="ig__chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>' +
+          '</button><div class="ig__body">' + body + '</div></section>';
       }
 
-      function setCoordSaveStatus(message, isError) {
-        if (!coordSaveStatus) return;
-        coordSaveStatus.textContent = message;
-        coordSaveStatus.classList.toggle('warn-text', Boolean(isError));
-        coordSaveStatus.classList.toggle('success-text', !isError && /saved/i.test(message));
-      }
-
-      function runCoordAutosave() {
-        if (coordAutosaveInFlight) {
-          coordAutosaveQueued = true;
-          return Promise.resolve(false);
-        }
-        coordAutosaveInFlight = true;
-        coordAutosaveQueued = false;
-        setCoordSaveStatus('Saving...', false);
-
-        return fetch(form.action, {
-          method: 'POST',
-          body: new FormData(form),
-          headers: { 'X-Requested-With': 'XMLHttpRequest' }
-        })
-          .then(async (response) => {
-            if (!response.ok) throw new Error('Save failed');
-            return response.json();
-          })
-          .then(() => {
-            setCoordSaveStatus('Saved.', false);
-            return true;
-          })
-          .catch(() => {
-            setCoordSaveStatus('Autosave failed. Use Save changes to retry.', true);
-            return false;
-          })
-          .finally(() => {
-            coordAutosaveInFlight = false;
-            if (coordAutosaveQueued) runCoordAutosave();
-          });
-      }
-
-      function scheduleCoordAutosave() {
-        if (coordAutosaveTimer) clearTimeout(coordAutosaveTimer);
-        setCoordSaveStatus('Unsaved changes', false);
-        coordAutosaveTimer = setTimeout(runCoordAutosave, 500);
-      }
-
-      function resizeCanvas() {
-        const container = canvas.parentElement;
-        maxCanvasWidth = container.clientWidth - 32;
-        maxCanvasHeight = container.clientHeight - 32;
-        drawPreview();
-      }
-
-      function loadCertImage() {
-        const img = new Image();
-        img.onload = () => {
-          certImage = img;
-          ensurePreviewFontLoaded().finally(resizeCanvas);
-        };
-        img.onerror = () => {
-          certImage = null;
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          const fallbackFont = selectedPreviewFont();
-          ctx.fillStyle = '#85858f';
-          ctx.font = `${fallbackFont.weight} 16px "${fallbackFont.family}", Arial`;
-          ctx.textAlign = 'center';
-          ctx.fillText('Preview unavailable', canvas.width / 2, canvas.height / 2);
-        };
-        img.src = `${templatePreviewUrl}?t=${Date.now()}`;
-      }
-
-      function persistSampleText() {
-        try {
-          sessionStorage.setItem(sampleTextStorageKey, sampleTextInput.value || '');
-        } catch (error) {
-          /* private browsing */
-        }
-      }
-
-      function restoreSampleText() {
-        try {
-          const stored = sessionStorage.getItem(sampleTextStorageKey);
-          if (stored !== null) sampleTextInput.value = stored;
-        } catch (error) {
-          /* private browsing */
-        }
-      }
-
-      function drawPreview() {
-        if (!certImage) return;
-
-        // Fit the template inside the canvas area, preserving aspect ratio.
-        const imgAspect = certImage.width / certImage.height;
-        let drawWidth = maxCanvasWidth;
-        let drawHeight = drawWidth / imgAspect;
-        if (drawHeight > maxCanvasHeight) {
-          drawHeight = maxCanvasHeight;
-          drawWidth = drawHeight * imgAspect;
-        }
-
-        scaleX = drawWidth / certImage.width;
-        scaleY = drawHeight / certImage.height;
-        canvas.width = drawWidth;
-        canvas.height = drawHeight;
-
-        ctx.drawImage(certImage, 0, 0, drawWidth, drawHeight);
-
-        const x = parseInt(textXInput.value, 10) * scaleX;
-        const y = parseInt(textYInput.value, 10) * scaleY;
-        const size = (parseInt(fontSizeInput.value, 10) * scaleX) / 2;
-        const color = fontColorInput.value || '#321812';
-        const displayText = sampleTextInput.value.trim() || 'Sample Text';
-        const font = selectedPreviewFont();
-
-        if (isDragging) {
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
-          ctx.beginPath();
-          ctx.arc(x, y, size * 1.8, 0, Math.PI * 2);
-          ctx.fill();
-        }
-
-        // Marker: a ring plus crosshair, drawn in the text colour so it stays visible.
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(x, y, size, 0, Math.PI * 2);
-        ctx.stroke();
-
-        ctx.beginPath();
-        ctx.moveTo(x - size * 1.5, y);
-        ctx.lineTo(x + size * 1.5, y);
-        ctx.moveTo(x, y - size * 1.5);
-        ctx.lineTo(x, y + size * 1.5);
-        ctx.stroke();
-
-        ctx.fillStyle = color;
-        ctx.font = `${font.weight} ${Math.max(10, parseInt(fontSizeInput.value, 10) * scaleX)}px "${font.family}", Arial`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(displayText, x, y);
-      }
-
-      // Pointer events rather than mouse events, so dragging works on touch too.
-      canvas.addEventListener('pointerdown', (event) => {
-        if (!certImage) return;
-        const rect = canvas.getBoundingClientRect();
-        const pointerX = event.clientX - rect.left;
-        const pointerY = event.clientY - rect.top;
-
-        const textX = parseInt(textXInput.value, 10) * scaleX;
-        const textY = parseInt(textYInput.value, 10) * scaleY;
-        const size = (parseInt(fontSizeInput.value, 10) * scaleX) / 2;
-
-        const distX = pointerX - textX;
-        const distY = pointerY - textY;
-        // Generous on touch: never smaller than a finger-sized target.
-        const grabRadius = Math.max(size * 2, 28);
-
-        if (Math.sqrt(distX * distX + distY * distY) < grabRadius) {
-          isDragging = true;
-          dragOffsetX = distX;
-          dragOffsetY = distY;
-          canvas.setPointerCapture(event.pointerId);
-          canvas.style.cursor = 'grabbing';
-          event.preventDefault();
-        }
+      const cv = document.getElementById("stage");
+      const ctx = cv.getContext("2d");
+      const wrap = document.getElementById("wrap");
+      const listEl = document.getElementById("list");
+      const inspEl = document.getElementById("inspector");
+      const countEl = document.getElementById("count");
+      const addBtn = document.getElementById("add");
+      const readout = document.getElementById("readout");
+      const saveState = document.getElementById("saveState");
+      const saveText = document.getElementById("saveText");
+      const saveBtn = document.getElementById("saveBtn");
+      const dimsEl = document.getElementById("dims");
+      // Explicit save forces an immediate write, cancelling the pending autosave debounce.
+      saveBtn.addEventListener("click", () => { clearTimeout(saveTimer); save(); });
+      // Leaving with unsaved edits: flush the save first, then navigate regardless of
+      // outcome (an unsavable draft - e.g. a validation error - shouldn't trap the user).
+      const backBtn = document.querySelector(".back-btn");
+      backBtn.addEventListener("click", (e) => {
+        const st = saveState.dataset.state;
+        if (st !== "dirty" && st !== "saving" && !saving) return;   // nothing pending: normal navigation
+        e.preventDefault();
+        const href = backBtn.getAttribute("href");
+        clearTimeout(saveTimer);
+        Promise.resolve(save()).finally(() => { window.location.href = href; });
       });
 
-      canvas.addEventListener('pointermove', (event) => {
-        if (!isDragging || !certImage) return;
-        const rect = canvas.getBoundingClientRect();
-        const newX = Math.round((event.clientX - rect.left - dragOffsetX) / scaleX);
-        const newY = Math.round((event.clientY - rect.top - dragOffsetY) / scaleY);
-        textXInput.value = Math.max(0, newX);
-        textYInput.value = Math.max(0, newY);
-        drawPreview();
-        event.preventDefault();
-      });
+      let template = null;              // the real template <img>
+      let TPL_W = 3508, TPL_H = 2480;
 
-      function endDrag(event) {
-        if (!isDragging) return;
-        isDragging = false;
-        canvas.style.cursor = 'crosshair';
-        if (event && event.pointerId !== undefined && canvas.hasPointerCapture(event.pointerId)) {
-          canvas.releasePointerCapture(event.pointerId);
+      // ── view transform (template space -> css px) ──
+      const PAD = 46;
+      let view = { s: 1, ox: 0, oy: 0 };
+      function fit() {
+        const w = wrap.clientWidth, h = wrap.clientHeight;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const s = Math.min((w - PAD * 2) / TPL_W, (h - PAD * 2) / TPL_H);
+        view = { s, ox: (w - TPL_W * s) / 2, oy: (h - TPL_H * s) / 2 };
+        draw();
+      }
+      const toScreen = (x, y) => [view.ox + x * view.s, view.oy + y * view.s];
+      const toTpl = (px, py) => [(px - view.ox) / view.s, (py - view.oy) / view.s];
+
+      function resolve(f) {
+        if (f.source === "input") return f.label || "Sample";
+        if (f.source === "static") return f.value || "—";
+        const row = SAMPLE_ROWS[sampleRow];
+        const v = row ? row[f.column] : undefined;
+        return v === undefined || v === "" ? "—" : String(v);
+      }
+      function looksPersonLevel(col) {
+        const words = String(col || "").toLowerCase().split(/[^a-z0-9]+/);
+        return PERSON_HINTS.some((h) => words.includes(h));
+      }
+      function ambiguousColumn(col) {
+        if (!col || !SAMPLE_ROWS.length) return null;
+        const byTeam = new Map();
+        const hasTeam = COLUMNS.includes("team");
+        if (!hasTeam) return null;
+        for (const r of SAMPLE_ROWS) {
+          const t = r.team; if (!byTeam.has(t)) byTeam.set(t, new Set()); byTeam.get(t).add(r[col]);
         }
-        drawPreview();
-        scheduleCoordAutosave();
+        for (const [t, vals] of byTeam) if (vals.size > 1) return t;
+        return null;
       }
 
-      canvas.addEventListener('pointerup', endDrag);
-      canvas.addEventListener('pointercancel', endDrag);
+      const canvasFamily = (key) => "cf_" + key;
+      function fontFor(f, size) { const opt = FONT_BY_KEY[f.font_key] || {};
+        return `${opt.weight || 700} ${size}px "${canvasFamily(f.font_key)}", sans-serif`; }
 
-      [textXInput, textYInput, fontSizeInput, fontColorInput, sampleTextInput].forEach((input) => {
-        input.addEventListener('input', drawPreview);
-      });
-      if (fontKeyInput) {
-        fontKeyInput.addEventListener('change', () => {
-          ensurePreviewFontLoaded().finally(drawPreview);
-        });
+      function layoutText(f) {
+        const text = resolve(f);
+        const maxW = f.max_width ? f.max_width * view.s : 0;
+        let size = f.font_size * view.s;
+        ctx.font = fontFor(f, size);
+        if (!maxW || ctx.measureText(text).width <= maxW) return { text, size };
+        if (f.overflow === "truncate") {
+          let out = text;
+          while (out.length > 1 && ctx.measureText(out + "…").width > maxW) out = out.slice(0, -1);
+          return { text: out + "…", size };
+        }
+        while (size > 8 * view.s && ctx.measureText(text).width > maxW) { size *= 0.94; ctx.font = fontFor(f, size); }
+        return { text, size };
+      }
+      function fieldBox(f) {
+        const { text, size } = layoutText(f);
+        ctx.font = fontFor(f, size);
+        const m = ctx.measureText(text), w = m.width;
+        const asc = m.actualBoundingBoxAscent || size * .74, desc = m.actualBoundingBoxDescent || size * .22;
+        const [sx, sy] = toScreen(f.x, f.y);
+        let left = sx - w / 2; if (f.align === "left") left = sx; if (f.align === "right") left = sx - w;
+        return { left, top: sy - asc, w, h: asc + desc, sx, sy, text, size };
       }
 
-      sampleTextInput.addEventListener('input', persistSampleText);
-
-      if (saveEditorButton) {
-        saveEditorButton.addEventListener('click', async () => {
-          persistSampleText();
-          saveEditorButton.disabled = true;
-          const originalLabel = saveEditorButton.textContent;
-          saveEditorButton.textContent = 'Saving...';
-          try {
-            const didSave = await runCoordAutosave();
-            saveEditorButton.textContent = didSave ? 'Saved' : originalLabel;
-            if (didSave) {
-              window.setTimeout(() => { saveEditorButton.textContent = originalLabel; }, 900);
-            }
-          } finally {
-            window.setTimeout(() => { saveEditorButton.disabled = false; }, 150);
+      function drawTemplate() {
+        const [ox, oy] = toScreen(0, 0), w = TPL_W * view.s, h = TPL_H * view.s;
+        ctx.save(); ctx.shadowColor = "rgba(0,0,0,.7)"; ctx.shadowBlur = 28; ctx.shadowOffsetY = 8;
+        ctx.fillStyle = "#f2ead9"; ctx.fillRect(ox, oy, w, h); ctx.restore();
+        if (template) ctx.drawImage(template, ox, oy, w, h);
+      }
+      function drawRulers() {
+        const [ox, oy] = toScreen(0, 0), w = TPL_W * view.s, h = TPL_H * view.s;
+        ctx.save(); ctx.strokeStyle = "#2e2e2e"; ctx.fillStyle = "#86868e"; ctx.lineWidth = 1;
+        ctx.font = '500 9px "IBM Plex Mono", monospace'; ctx.textBaseline = "alphabetic";
+        const step = Math.max(250, Math.round(TPL_W / 8 / 250) * 250);
+        ctx.textAlign = "center";
+        for (let x = 0; x <= TPL_W; x += step) { const sx = Math.round(ox + x * view.s) + .5;
+          ctx.beginPath(); ctx.moveTo(sx, oy - 12); ctx.lineTo(sx, oy - 5); ctx.stroke(); ctx.fillText(String(x), sx, oy - 17); }
+        ctx.textAlign = "right";
+        for (let y = 0; y <= TPL_H; y += step) { const sy = Math.round(oy + y * view.s) + .5;
+          ctx.beginPath(); ctx.moveTo(ox - 12, sy); ctx.lineTo(ox - 5, sy); ctx.stroke(); ctx.fillText(String(y), ox - 16, sy + 3); }
+        ctx.restore();
+      }
+      let guides = [];
+      function drawFields() {
+        fields.forEach((f, i) => {
+          const b = fieldBox(f), hue = HUES[i % HUES.length], on = i === selected;
+          ctx.save(); ctx.font = fontFor(f, b.size);
+          ctx.textAlign = f.align === "left" ? "left" : f.align === "right" ? "right" : "center";
+          ctx.textBaseline = "alphabetic"; ctx.fillStyle = f.font_color; ctx.fillText(b.text, b.sx, b.sy); ctx.restore();
+          ctx.save(); ctx.strokeStyle = hue; ctx.globalAlpha = on ? 1 : .45; ctx.lineWidth = on ? 1.5 : 1;
+          if (!on) ctx.setLineDash([3, 3]);
+          ctx.strokeRect(Math.round(b.left) - 4.5, Math.round(b.top) - 4.5, Math.round(b.w) + 9, Math.round(b.h) + 9); ctx.restore();
+          ctx.save(); ctx.globalAlpha = on ? 1 : .5; const tw = 15, th = 13;
+          ctx.fillStyle = hue; ctx.fillRect(Math.round(b.left) - 4.5, Math.round(b.top) - 4.5 - th, tw, th);
+          ctx.fillStyle = "#000"; ctx.font = '600 9px "IBM Plex Mono", monospace'; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillText(String(i + 1), Math.round(b.left) - 4.5 + tw / 2, Math.round(b.top) - 4.5 - th / 2 + .5); ctx.restore();
+          if (!on) return;
+          const [mx] = toScreen(f.x, f.y);
+          ctx.save(); ctx.strokeStyle = hue; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(b.sx - 9, b.sy); ctx.lineTo(b.sx + 9, b.sy);
+          ctx.moveTo(b.sx, b.sy - 9); ctx.lineTo(b.sx, b.sy + 9); ctx.stroke();
+          ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(b.sx, b.sy, 3, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore();
+          if (f.max_width) {
+            const half = (f.max_width * view.s) / 2; let ml = mx - half, mr = mx + half;
+            if (f.align === "left") { ml = mx; mr = mx + f.max_width * view.s; }
+            if (f.align === "right") { ml = mx - f.max_width * view.s; mr = mx; }
+            const my = Math.round(b.top + b.h) + 13.5;
+            ctx.save(); ctx.strokeStyle = hue; ctx.globalAlpha = .55; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(ml, my - 4); ctx.lineTo(ml, my + 4); ctx.moveTo(ml, my); ctx.lineTo(mr, my);
+            ctx.moveTo(mr, my - 4); ctx.lineTo(mr, my + 4); ctx.stroke();
+            ctx.globalAlpha = .9; ctx.fillStyle = hue; ctx.font = '500 9px "IBM Plex Mono", monospace';
+            ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText("max " + f.max_width, (ml + mr) / 2, my + 5); ctx.restore();
           }
         });
       }
+      function drawGuides() {
+        if (!guides.length) return;
+        ctx.save(); ctx.strokeStyle = "#fff"; ctx.globalAlpha = .5; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+        const [ox, oy] = toScreen(0, 0);
+        for (const g of guides) { ctx.beginPath();
+          if (g.axis === "x") { const [sx] = toScreen(g.at, 0); ctx.moveTo(Math.round(sx) + .5, oy); ctx.lineTo(Math.round(sx) + .5, oy + TPL_H * view.s); }
+          else { const [, sy] = toScreen(0, g.at); ctx.moveTo(ox, Math.round(sy) + .5); ctx.lineTo(ox + TPL_W * view.s, Math.round(sy) + .5); }
+          ctx.stroke(); }
+        ctx.restore();
+      }
+      function draw() { ctx.clearRect(0, 0, cv.width, cv.height); drawTemplate(); drawRulers(); drawFields(); drawGuides(); }
 
-      [textXInput, textYInput, fontSizeInput].forEach((input) => {
-        input.addEventListener('input', scheduleCoordAutosave);
+      // ── interaction ──
+      let drag = null;
+      function hitTest(px, py) {
+        for (let i = fields.length - 1; i >= 0; i--) { const b = fieldBox(fields[i]);
+          if (px >= b.left - 6 && px <= b.left + b.w + 6 && py >= b.top - 6 && py <= b.top + b.h + 6) return i; }
+        return -1;
+      }
+      cv.addEventListener("pointermove", (e) => {
+        const r = cv.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+        if (!drag) { cv.classList.toggle("is-over", hitTest(px, py) !== -1); return; }
+        const [tx, ty] = toTpl(px, py); const f = fields[selected];
+        let nx = Math.round(tx - drag.dx), ny = Math.round(ty - drag.dy);
+        guides = []; const SNAP = 14 / view.s;
+        const xs = [TPL_W / 2, ...fields.filter((_, i) => i !== selected).map((o) => o.x)];
+        const ys = [TPL_H / 2, ...fields.filter((_, i) => i !== selected).map((o) => o.y)];
+        for (const c of xs) if (Math.abs(nx - c) < SNAP) { nx = Math.round(c); guides.push({ axis: "x", at: c }); break; }
+        for (const c of ys) if (Math.abs(ny - c) < SNAP) { ny = Math.round(c); guides.push({ axis: "y", at: c }); break; }
+        f.x = Math.max(0, Math.min(TPL_W, nx)); f.y = Math.max(0, Math.min(TPL_H, ny));
+        showReadout(px, py, f); markDirty(); draw(); syncInspectorValues(); syncRowSub(selected);
       });
-      fontColorInput.addEventListener('change', scheduleCoordAutosave);
-      if (fontKeyInput) fontKeyInput.addEventListener('change', scheduleCoordAutosave);
+      cv.addEventListener("pointerdown", (e) => {
+        const r = cv.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+        const i = hitTest(px, py); if (i === -1) return;
+        select(i); const [tx, ty] = toTpl(px, py); drag = { dx: tx - fields[i].x, dy: ty - fields[i].y };
+        try { cv.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
+        cv.classList.add("is-dragging"); showReadout(px, py, fields[i]);
+      });
+      function endDrag() { if (!drag) return; drag = null; guides = []; cv.classList.remove("is-dragging"); readout.classList.remove("on"); draw(); }
+      cv.addEventListener("pointerup", endDrag); cv.addEventListener("pointercancel", endDrag);
+      function showReadout(px, py, f) {
+        readout.innerHTML = '<span class="k">X</span> ' + f.x + "&nbsp;&nbsp;<span class=\"k\">Y</span> " + f.y;
+        readout.style.left = px + "px"; readout.style.top = py + "px"; readout.classList.add("on");
+      }
+      document.addEventListener("keydown", (e) => {
+        const t = e.target; if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.isContentEditable)) return;
+        if (!fields.length) return;
+        if (e.key === "Tab") { e.preventDefault(); select((selected + (e.shiftKey ? -1 : 1) + fields.length) % fields.length); return; }
+        if (e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); removeField(selected); return; }
+        const step = e.shiftKey ? 10 : 1;
+        const map = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+        const d = map[e.key]; if (!d) return; e.preventDefault(); const f = fields[selected];
+        f.x = Math.max(0, Math.min(TPL_W, f.x + d[0])); f.y = Math.max(0, Math.min(TPL_H, f.y + d[1]));
+        markDirty(); draw(); syncInspectorValues(); syncRowSub(selected);
+      });
 
-      window.addEventListener('resize', resizeCanvas);
-      window.addEventListener('load', () => {
-        restoreSampleText();
-        loadCertImage();
-      });
+      // ── field list ──
+      const ICON_X = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
+      const ICON_GRIP = '<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="6" cy="4" r="1.3"/><circle cx="10" cy="4" r="1.3"/><circle cx="6" cy="8" r="1.3"/><circle cx="10" cy="8" r="1.3"/><circle cx="6" cy="12" r="1.3"/><circle cx="10" cy="12" r="1.3"/></svg>';
+      const ICON_WARN = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 2.5L14.5 14h-13L8 2.5z"/><path d="M8 6.5v3.2M8 11.8v.4"/></svg>';
+      const ICON_LOCK = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.8 7V5.2a2.2 2.2 0 014.4 0V7"/></svg>';
+      const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      const srcLabel = (f) => f.source;
+      function rowSub(f) { const pos = f.x + ", " + f.y;
+        if (f.source === "csv") return pos + " · " + (f.column || "no column");
+        if (f.source === "static") return pos + ' · "' + (f.value || "").slice(0, 18) + '"';
+        return pos + " · participant types this"; }
+      function renderList() {
+        listEl.innerHTML = "";
+        fields.forEach((f, i) => {
+          const li = document.createElement("li");
+          li.className = "field-row" + (i === selected ? " sel" : ""); li.style.setProperty("--hue", HUES[i % HUES.length]);
+          li.draggable = true; li.dataset.i = i;
+          li.innerHTML = '<span class="spine"></span><span class="f-main"><span class="f-label">' + esc(f.label) +
+            '</span><span class="f-sub" data-sub>' + esc(rowSub(f)) + '</span></span><span class="src" data-s="' + f.source + '">' + srcLabel(f) +
+            '</span><span style="display:flex;align-items:center;gap:2px"><span class="grip" title="Drag to reorder">' + ICON_GRIP +
+            '</span><button class="icon-btn" data-remove title="Remove">' + ICON_X + "</button></span>";
+          li.addEventListener("click", (e) => { if (e.target.closest("[data-remove]")) { removeField(i); return; } select(i); });
+          li.addEventListener("dragstart", (e) => { li.classList.add("dragging"); e.dataTransfer.setData("text/plain", String(i)); });
+          li.addEventListener("dragend", () => { li.classList.remove("dragging"); clearDrop(); });
+          li.addEventListener("dragover", (e) => { e.preventDefault(); const r = li.getBoundingClientRect();
+            clearDrop(); li.classList.add(e.clientY > r.top + r.height / 2 ? "drop-after" : "drop-before"); });
+          li.addEventListener("drop", (e) => { e.preventDefault(); const from = Number(e.dataTransfer.getData("text/plain"));
+            const r = li.getBoundingClientRect(); let to = Number(li.dataset.i) + (e.clientY > r.top + r.height / 2 ? 1 : 0); clearDrop(); reorder(from, to); });
+          listEl.appendChild(li);
+        });
+        const n = fields.length; countEl.textContent = n + " / " + MAX_FIELDS; countEl.classList.toggle("at-cap", n >= MAX_FIELDS);
+        addBtn.disabled = n >= MAX_FIELDS; addBtn.textContent = n >= MAX_FIELDS ? "Maximum of " + MAX_FIELDS + " fields reached" : "Add field";
+      }
+      function clearDrop() { listEl.querySelectorAll(".field-row").forEach((el) => el.classList.remove("drop-before", "drop-after")); }
+      function syncRowSub(i) { const el = listEl.querySelector('.field-row[data-i="' + i + '"] [data-sub]'); if (el) el.textContent = rowSub(fields[i]); }
+      function reorder(from, to) { if (from === to || from + 1 === to) return; const [m] = fields.splice(from, 1);
+        if (to > from) to--; fields.splice(to, 0, m); selected = to; markDirty(); renderAll(); }
+      function select(i) { if (i === selected) { return; } selected = i; renderList(); renderInspector(); draw(); }
+      function addField() {
+        if (fields.length >= MAX_FIELDS) return;
+        fields.push(fromServer({ id: "field_" + (fields.length + 1), label: "New field", source: "static",
+          value: "Text", x: Math.round(TPL_W / 2), y: Math.round(TPL_H / 2), font_size: 60, font_color: [50, 34, 24] }, fields.length));
+        selected = fields.length - 1; markDirty(); renderAll();
+      }
+      addBtn.addEventListener("click", addField);
+      function removeField(i) { if (fields.length <= 1) return; fields.splice(i, 1); if (selected >= fields.length) selected = fields.length - 1; markDirty(); renderAll(); }
+
+      // ── inspector ──
+      function renderInspector() {
+        const f = fields[selected];
+        if (!f) { inspEl.innerHTML = '<p class="empty">No fields.</p>'; return; }
+        const hue = HUES[selected % HUES.length];
+        const amb = f.source === "csv" ? ambiguousColumn(f.column) : null;
+        const noCsv = !DATA.hasCsv || !COLUMNS.length;
+        const whereBody =
+          '<div class="seg" role="group" aria-label="Value source">' +
+          '<button data-src="input" data-s="input" aria-pressed="' + (f.source === "input") + '">Input</button>' +
+          '<button data-src="csv" data-s="csv" aria-pressed="' + (f.source === "csv") + '"' + (noCsv ? " disabled title=\"Upload a participants file first\"" : "") + '>CSV</button>' +
+          '<button data-src="static" data-s="static" aria-pressed="' + (f.source === "static") + '">Static</button></div>' +
+          sourceBody(f, noCsv) +
+          (amb ? '<div class="note warn">' + ICON_WARN + "<span><b>" + esc(f.column) + "</b> is not consistent within every team &mdash; team <code>" +
+            esc(amb) + "</code> has more than one value. Participants will need to select their name too.</span></div>" : "");
+        const labelBody =
+          '<div class="ctl"><label for="i-label">Label</label><input id="i-label" type="text" value="' + esc(f.label) + '" data-k="label" style="font-family:var(--ui)"></div>' +
+          '<div class="ctl" style="margin-top:10px"><label for="i-id">Field id</label><input id="i-id" type="text" value="' + esc(f.id) + '" data-k="id">' +
+          '<p class="hint">Used in the certificate link. Changing it re-issues links for this field.</p></div>';
+        const placeBody =
+          '<div class="pair">' +
+          '<div class="ctl"><label for="i-x">X</label><input id="i-x" type="number" min="0" max="' + TPL_W + '" value="' + f.x + '" data-k="x" data-num></div>' +
+          '<div class="ctl"><label for="i-y">Y</label><input id="i-y" type="number" min="0" max="' + TPL_H + '" value="' + f.y + '" data-k="y" data-num></div></div>' +
+          '<div class="pair" style="margin-top:10px"><div class="ctl"><label for="i-align">Align</label><select id="i-align" data-k="align">' +
+          ["left", "center", "right"].map((a) => '<option value="' + a + '"' + (f.align === a ? " selected" : "") + ">" + a + "</option>").join("") +
+          '</select></div><div class="ctl"><label for="i-mw">Max width</label><input id="i-mw" type="number" min="0" max="' + TPL_W + '" value="' + (f.max_width || "") + '" placeholder="none" data-k="max_width" data-num-null></div></div>' +
+          '<div class="ctl" style="margin-top:10px"><label for="i-of">If the text is too wide</label><select id="i-of" data-k="overflow">' +
+          '<option value="shrink"' + (f.overflow === "shrink" ? " selected" : "") + ">Shrink to fit</option>" +
+          '<option value="truncate"' + (f.overflow === "truncate" ? " selected" : "") + ">Truncate with an ellipsis</option></select></div>";
+        const typeBody =
+          '<div class="ctl"><label for="i-font">Typeface</label><select id="i-font" data-k="font_key">' +
+          FONTS.map((o) => '<option value="' + o.key + '"' + (f.font_key === o.key ? " selected" : "") + ">" + esc(o.label) + "</option>").join("") +
+          '</select></div><div class="pair" style="margin-top:10px"><div class="ctl"><label for="i-size">Size</label>' +
+          '<input id="i-size" type="number" min="8" max="600" value="' + f.font_size + '" data-k="font_size" data-num></div>' +
+          '<div class="ctl"><label for="i-color">Colour</label><input id="i-color" type="color" value="' + f.font_color + '" data-k="font_color"></div></div>';
+        const previewBody = SAMPLE_ROWS.length ?
+          ('<div class="ctl"><label for="i-sample">Sample participant</label>' +
+            '<select id="i-sample">' + SAMPLE_ROWS.map((r, i) => '<option value="' + i + '"' + (sampleRow === i ? " selected" : "") + ">" +
+            esc(Object.values(r)[0] || ("Row " + (i + 1))) + "</option>").join("") + '</select>' +
+            '<p class="hint">Every <code>csv</code> field previews against this row.</p></div>') : "";
+        inspEl.innerHTML =
+          '<div class="insp-head" style="--hue:' + hue + '"><span class="n">' + String(selected + 1).padStart(2, "0") +
+          '</span><h3>' + esc(f.label) + '</h3></div>' +
+          grp("where", "Where the value comes from", whereBody) +
+          grp("label", "Label &amp; identity", labelBody) +
+          grp("place", "Placement", placeBody) +
+          grp("type", "Type", typeBody) +
+          (previewBody ? grp("preview", "Preview", previewBody) : "");
+
+        inspEl.querySelectorAll("[data-gtoggle]").forEach((b) => b.addEventListener("click", () => {
+          const key = b.dataset.gtoggle; groupCollapsed[key] = !groupCollapsed[key];
+          b.closest(".ig").classList.toggle("is-collapsed", groupCollapsed[key]);
+        }));
+
+        inspEl.querySelectorAll("[data-src]").forEach((b) => b.addEventListener("click", () => {
+          if (b.disabled) return; const f2 = fields[selected]; f2.source = b.dataset.src;
+          if (f2.source === "csv" && !f2.column) f2.column = COLUMNS[0] || "";
+          markDirty(); renderAll();
+        }));
+        inspEl.querySelectorAll("[data-k]").forEach((el) => el.addEventListener("input", () => {
+          const f2 = fields[selected], k = el.dataset.k;
+          if (el.hasAttribute("data-num")) f2[k] = clampNum(el);
+          else if (el.hasAttribute("data-num-null")) f2[k] = el.value === "" ? null : clampNum(el);
+          else f2[k] = el.value;
+          markDirty();
+          if (["label", "column", "value", "x", "y"].includes(k)) { renderList();
+            if (k === "label") inspEl.querySelector(".insp-head h3").textContent = f2.label; }
+          draw();
+        }));
+        const col = inspEl.querySelector("#i-column"); if (col) col.addEventListener("change", () => { renderInspector(); draw(); });
+        const dd = inspEl.querySelector("#i-dropdown"); if (dd) dd.addEventListener("change", () => { fields[selected].dropdown = dd.checked; markDirty(); renderInspector(); });
+        const sr = inspEl.querySelector("#i-sample"); if (sr) sr.addEventListener("change", () => { sampleRow = Number(sr.value); draw(); });
+      }
+      function sourceBody(f, noCsv) {
+        if (f.source === "input")
+          return '<div class="note warn">' + ICON_WARN + "<span><b>The participant types this.</b> Whatever they enter is printed. Never use an input field for a position, score, or anything that has to be earned.</span></div>";
+        if (f.source === "static")
+          return '<div class="ctl" style="margin-top:11px"><label for="i-value">Value printed on every certificate</label>' +
+            '<input id="i-value" type="text" value="' + esc(f.value) + '" data-k="value" style="font-family:var(--ui)"></div>' +
+            '<div class="note">' + ICON_LOCK + "<span>The same on every certificate. Participants cannot change it.</span></div>";
+        if (noCsv)
+          return '<div class="note warn">' + ICON_WARN + "<span>No participants file is uploaded, so there are no columns to read. Upload one, or use Input or Static.</span></div>";
+        const isPerson = looksPersonLevel(f.column);
+        return '<div class="ctl" style="margin-top:11px"><label for="i-column">Column from the participants file</label>' +
+          '<select id="i-column" data-k="column">' + COLUMNS.map((c) => '<option value="' + esc(c) + '"' + (f.column === c ? " selected" : "") + ">" + esc(c) + "</option>").join("") + "</select></div>" +
+          '<div class="note">' + ICON_LOCK + "<span>Read from the row the participant matched. They never type it and cannot change it. Prints verbatim &mdash; <code>07</code> stays <code>07</code>.</span></div>" +
+          (isPerson ? '<div class="note warn">' + ICON_WARN + "<span>This looks like a per-person column. It is filled from the matched row automatically &mdash; that is fine. (Publishing it as a public dropdown is a separate setting on the event form.)</span></div>" : "");
+      }
+      function syncInspectorValues() {
+        const f = fields[selected]; if (!f) return;
+        const x = inspEl.querySelector('[data-k="x"]'), y = inspEl.querySelector('[data-k="y"]');
+        if (x && document.activeElement !== x) x.value = f.x; if (y && document.activeElement !== y) y.value = f.y;
+      }
+      function clampNum(el) { const n = Number(el.value); if (Number.isNaN(n)) return 0;
+        const lo = el.min === "" ? -Infinity : Number(el.min), hi = el.max === "" ? Infinity : Number(el.max);
+        return Math.max(lo, Math.min(hi, Math.round(n))); }
+
+      // ── autosave ──
+      let saveTimer = null, saving = false, queued = false, savePromise = null;
+      function markDirty() { saveState.dataset.state = "dirty"; saveText.textContent = "Unsaved changes";
+        saveBtn.disabled = false; saveBtn.textContent = "Save";
+        clearTimeout(saveTimer); saveTimer = setTimeout(save, 700); }
+      function save() {
+        if (saving) { queued = true; return savePromise || Promise.resolve(); }
+        saving = true; queued = false; saveState.dataset.state = "saving"; saveText.textContent = "Saving…";
+        saveBtn.disabled = true; saveBtn.textContent = "Saving…";
+        savePromise = fetch(DATA.saveUrl, { method: "POST", headers: { "Content-Type": "application/json",
+          "X-CSRF-Token": DATA.csrf, "X-Requested-With": "XMLHttpRequest" },
+          body: JSON.stringify({ fields: fields.map(toServer) }) })
+          .then(async (res) => { const body = await res.json().catch(() => ({}));
+            if (!res.ok || !body.ok) throw new Error(body.error || "Save failed");
+            saveState.dataset.state = "saved"; saveText.textContent = "Saved"; saveBtn.textContent = "Saved"; })
+          .catch((err) => { saveState.dataset.state = "error"; saveText.textContent = err.message || "Save failed";
+            saveBtn.textContent = "Retry save"; })
+          .finally(() => { saving = false; saveBtn.disabled = false; if (queued) save(); });
+        return savePromise;
+      }
+
+      function renderAll() { renderList(); renderInspector(); draw(); }
+
+      // ── boot ──
+      function loadFonts() {
+        if (!window.FontFace) return Promise.resolve();
+        return Promise.all(FONTS.map((o) => {
+          const face = new FontFace(canvasFamily(o.key), "url(" + o.url + ")", { weight: String(o.weight || 700) });
+          return face.load().then((f) => document.fonts.add(f)).catch(() => undefined);
+        }));
+      }
+      function loadTemplate() {
+        return new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => { template = img; TPL_W = img.naturalWidth || 3508; TPL_H = img.naturalHeight || 2480;
+            dimsEl.textContent = TPL_W + " × " + TPL_H; resolve(); };
+          img.onerror = () => { dimsEl.textContent = "template unavailable"; resolve(); };
+          img.src = DATA.templateUrl + "?t=" + Date.now();
+        });
+      }
+      new ResizeObserver(fit).observe(wrap);
+      renderAll();
+      Promise.all([loadTemplate(), loadFonts()]).then(fit);
     </script>
   </body>
 </html>

@@ -98,6 +98,10 @@ def setup_scratch_event(validation_type="email") -> str:
     A._RENDERED_CERT_CACHE.clear()
     A._EVENT_STATE_CACHE = None
     A._EVENT_STATE_CACHE_AT = 0.0
+    # Fresh, empty club store per scratch event (tests run with DATABASE_URL unset,
+    # so the repository is the in-memory backend and lives as a module global).
+    A._PUBLIC_EVENT_CACHE.clear()
+    A._repository = A.db.InMemoryRepository()
 
     event_dir = os.path.join(A.EVENTS_DIR, TEST_SLUG)
     os.makedirs(event_dir, exist_ok=True)

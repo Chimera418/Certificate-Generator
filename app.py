@@ -10,21 +10,28 @@ import re
 import secrets
 import shutil
 import tempfile
+import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 from functools import wraps
+from datetime import timedelta
 from io import BytesIO, StringIO
 from uuid import uuid4
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import (Flask, abort, g, jsonify, make_response, redirect, render_template,
+                   request, send_file, session, url_for)
 from PIL import Image, ImageDraw, ImageFont
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import BadSignature, URLSafeSerializer
 from dotenv import load_dotenv
 import yaml
+
+import db
 
 load_dotenv()
 app = Flask(__name__)
@@ -40,10 +47,41 @@ if not _SECRET_KEY:
 		"work at all with more than one worker. Set SECRET_KEY in the environment."
 	)
 app.secret_key = _SECRET_KEY
+
+# The club/event store. make_repository() picks Postgres when DATABASE_URL is set
+# and an in-memory store otherwise, announcing which at startup. Held in a module
+# global so tests can inject a backend (a real in-memory one, or a stub that
+# raises to exercise the Postgres-down path).
+_repository = db.make_repository()
+
+
+def repo() -> "db.Repository":
+	return _repository
+
+
+@app.errorhandler(db.DatabaseUnavailable)
+def _database_unavailable(_exc):
+	"""Postgres is configured but unreachable. Fail closed - never serve stale or
+	empty account data - with a 503 the client can retry."""
+	if request.headers.get("X-Requested-With") == "XMLHttpRequest" or request.is_json:
+		response = jsonify({"ok": False, "error": "The service is temporarily unavailable."})
+	else:
+		response = make_response(
+			render_template("service_unavailable.html")
+			if os.path.exists(os.path.join(BASE_DIR, "templates", "service_unavailable.html"))
+			else "Service temporarily unavailable. Please try again shortly.", 503)
+	response.status_code = 503
+	response.headers["Retry-After"] = "10"
+	response.cache_control.no_store = True
+	return response
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
+# Logins persist across browser restarts: sessions marked permanent get a signed
+# cookie with this rolling lifetime (refreshed each request) instead of dying when
+# the browser closes. Auth stays in the HTTPOnly cookie - never in localStorage.
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_EVENTS_DIR = os.path.join(BASE_DIR, "events")
@@ -69,6 +107,19 @@ GENERATED_DIR = os.path.join(RUNTIME_WRITABLE_DIR, "generated_certificates")
 # directory is read-only on some hosts.
 LOG_DIR = os.path.join(RUNTIME_WRITABLE_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "system.log")
+
+
+def log_event(category: str, message: str) -> None:
+	"""Append a line to the admin-visible system log. Best-effort: a read-only or
+	full filesystem must never turn a log write into a request failure."""
+	import datetime
+	try:
+		os.makedirs(LOG_DIR, exist_ok=True)
+		with open(LOG_FILE, "a", encoding="utf-8") as f:
+			stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+			f.write(f"[{stamp}] [{category}] {message}\n")
+	except OSError:
+		pass
 FONT_PATH = os.path.join(BASE_DIR, "fonts", "Montserrat-Bold.ttf")
 DEFAULT_FONT_KEY = "montserrat_bold"
 FONT_OPTIONS = {
@@ -122,6 +173,12 @@ _EVENT_CSV_CACHE_TTL_SEC = 30.0
 # A decoded template is tens of megabytes (an A4 300 DPI page is 8.7 MP), so these
 # caches stay small. Templates are held as RGB unless they really carry alpha,
 # which is 25% less memory than RGBA and buys a couple more cache slots.
+#
+# The template cache is bounded by bytes, not entries: six A4 300 DPI pages is
+# 150 MB while six phone-sized ones is 3 MB, so an entry count is a guess at the
+# thing that actually runs out. With many clubs cycling many distinct templates
+# through one cache, that guess is what OOM-kills the worker.
+TEMPLATE_CACHE_MAX_BYTES = _env_int("TEMPLATE_CACHE_MAX_BYTES", 96 * 1024 * 1024)
 _TEMPLATE_CACHE_MAX = _env_int("TEMPLATE_CACHE_MAX", 6)
 _RENDER_CACHE_MAX = _env_int("RENDER_CACHE_MAX", 6)
 _FONT_CACHE_MAX = 20
@@ -134,9 +191,74 @@ PREVIEW_MAX_WIDTH = _env_int("PREVIEW_MAX_WIDTH", 1200)
 PREVIEW_JPEG_QUALITY = _env_int("PREVIEW_JPEG_QUALITY", 90)
 DOWNLOAD_PNG_COMPRESS_LEVEL = _env_int("DOWNLOAD_PNG_COMPRESS_LEVEL", 3)
 
+# Download format, per event. PNG at any compression level costs 250-530 ms for a
+# 3508x2480 page; JPEG q92 costs ~45 ms and produces 3.5x fewer bytes, which is the
+# difference between needing a core and needing a tenth of one at 1.7 arrivals/sec.
+#
+# An absent "download_format" means PNG, so every event that predates this change
+# renders byte-identically with no migration. New events are created with "jpeg"
+# written explicitly, so "absent" only ever describes a legacy config.
+DOWNLOAD_FORMATS = ("png", "jpeg")
+DEFAULT_DOWNLOAD_FORMAT = "png"
+NEW_EVENT_DOWNLOAD_FORMAT = "jpeg"
+DOWNLOAD_JPEG_QUALITY = _env_int("DOWNLOAD_JPEG_QUALITY", 92)
+# 4:4:4. JPEG's default 4:2:0 halves chroma resolution and bleeds colour around
+# sharp text edges: measured RMS error over the text box roughly doubles for
+# saturated text (1.68 -> 3.51), which is exactly what a club's brand colour is.
+# Costs ~10 ms and ~200 KB per render, leaving it 6x cheaper than PNG.
+DOWNLOAD_JPEG_SUBSAMPLING = 0
+DOWNLOAD_MIMETYPE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg"}
+
+class _ByteCappedCache:
+	"""
+	LRU cache bounded by total stored bytes as well as by entry count.
+
+	Entry count is the wrong bound for anything whose entries differ by orders of
+	magnitude in size. Bytes make the ceiling a RAM budget instead of a guess; the
+	entry cap is kept as a secondary bound so an existing TEMPLATE_CACHE_MAX in a
+	deployment's environment still means what it used to.
+	"""
+
+	def __init__(self, max_bytes: int, max_entries: int):
+		self.max_bytes = max_bytes
+		self.max_entries = max_entries
+		self.total_bytes = 0
+		self._entries: "OrderedDict[str, tuple]" = OrderedDict()
+
+	def get(self, key: str):
+		entry = self._entries.get(key)
+		if entry is None:
+			return None
+		self._entries.move_to_end(key)
+		return entry[0]
+
+	def put(self, key: str, value, nbytes: int) -> None:
+		previous = self._entries.pop(key, None)
+		if previous is not None:
+			self.total_bytes -= previous[1]
+		self._entries[key] = (value, nbytes)
+		self.total_bytes += nbytes
+		# An entry larger than the whole budget is evicted immediately rather than
+		# held: better to re-decode it than to blow the budget it was sized against.
+		while self._entries and (self.total_bytes > self.max_bytes
+								 or len(self._entries) > self.max_entries):
+			_, evicted = self._entries.popitem(last=False)
+			self.total_bytes -= evicted[1]
+
+	def clear(self) -> None:
+		self._entries.clear()
+		self.total_bytes = 0
+
+	def __len__(self) -> int:
+		return len(self._entries)
+
+	def __contains__(self, key: str) -> bool:
+		return key in self._entries
+
+
 # Every cache key embeds the template version and render settings, so a replaced
 # template or an edited coordinate produces a new key instead of a stale hit.
-_TEMPLATE_IMAGE_CACHE: "OrderedDict[str, Image.Image]" = OrderedDict()
+_TEMPLATE_IMAGE_CACHE = _ByteCappedCache(TEMPLATE_CACHE_MAX_BYTES, _TEMPLATE_CACHE_MAX)
 _RENDERED_CERT_CACHE: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
 _FONT_CACHE: "OrderedDict[str, ImageFont.FreeTypeFont | ImageFont.ImageFont]" = OrderedDict()
 
@@ -154,10 +276,125 @@ def _cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
 	while len(cache) > max_size:
 		cache.popitem(last=False)
 
+
+# ─── Render concurrency ───────────────────────────────────────────────────────
+#
+# A render is CPU-bound Pillow work holding a ~25 MB image copy for its duration,
+# so unbounded concurrency does not serve a spike faster - it OOM-kills the worker
+# and everyone loses. Requests queue here instead. The per-tenant limit stops one
+# busy event from taking every slot on the instance.
+#
+# Tenants are events today; in Phase 1 the key becomes the club id, which is why
+# render_certificate takes a tenant_key instead of assuming the slug.
+
+def _cgroup_cpu_quota() -> float | None:
+	"""CPU quota this container is allowed, in cores, or None if unrestricted."""
+	try:  # cgroup v2
+		with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:
+			quota, period = f.read().split()
+		if quota != "max" and float(period) > 0:
+			return float(quota) / float(period)
+	except (OSError, ValueError):
+		pass
+	try:  # cgroup v1
+		with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as f:
+			quota = int(f.read().strip())
+		with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as f:
+			period = int(f.read().strip())
+		if quota > 0 and period > 0:
+			return quota / period
+	except (OSError, ValueError):
+		pass
+	return None
+
+
+def available_cores() -> int:
+	"""
+	Cores this process may actually use.
+
+	os.cpu_count() reports the *host's* cores, not the container's quota, so on a
+	fractional-CPU instance it over-reports by an order of magnitude - which is
+	precisely the over-subscription the semaphore exists to prevent.
+	"""
+	quota = _cgroup_cpu_quota()
+	if quota is not None:
+		return max(1, int(quota))
+	return max(1, os.cpu_count() or 1)
+
+
+RENDER_MAX_CONCURRENCY = _env_int("RENDER_MAX_CONCURRENCY", available_cores())
+RENDER_MAX_CONCURRENCY_PER_TENANT = _env_int(
+	"RENDER_MAX_CONCURRENCY_PER_TENANT", max(1, RENDER_MAX_CONCURRENCY // 2))
+# Bounded so a spike sheds load with a 503 instead of piling up until gunicorn's
+# --timeout kills the worker and takes every in-flight request with it.
+RENDER_QUEUE_TIMEOUT_SEC = _env_int("RENDER_QUEUE_TIMEOUT_SEC", 30)
+
+_RENDER_SLOTS = threading.BoundedSemaphore(RENDER_MAX_CONCURRENCY)
+_TENANT_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+_TENANT_SLOTS_LOCK = threading.Lock()
+
+
+class RenderCapacityError(RuntimeError):
+	"""No render slot came free before the queue timeout. Serve a 503, not a 404."""
+
+
+def configure_render_slots(max_concurrency: int | None = None,
+						   per_tenant: int | None = None) -> None:
+	"""Resize the render semaphores. Used by the load test and the test suite."""
+	global RENDER_MAX_CONCURRENCY, RENDER_MAX_CONCURRENCY_PER_TENANT, _RENDER_SLOTS
+	if max_concurrency is not None:
+		RENDER_MAX_CONCURRENCY = max(1, max_concurrency)
+	if per_tenant is not None:
+		RENDER_MAX_CONCURRENCY_PER_TENANT = max(1, per_tenant)
+	_RENDER_SLOTS = threading.BoundedSemaphore(RENDER_MAX_CONCURRENCY)
+	with _TENANT_SLOTS_LOCK:
+		_TENANT_SLOTS.clear()
+
+
+def _tenant_slots(tenant_key: str) -> threading.BoundedSemaphore:
+	with _TENANT_SLOTS_LOCK:
+		slots = _TENANT_SLOTS.get(tenant_key)
+		if slots is None:
+			slots = threading.BoundedSemaphore(RENDER_MAX_CONCURRENCY_PER_TENANT)
+			_TENANT_SLOTS[tenant_key] = slots
+		return slots
+
+
+@contextmanager
+def render_slot(tenant_key: str):
+	"""
+	Hold one per-tenant and one global render slot, or raise RenderCapacityError.
+
+	The tenant slot is taken first: a tenant already at its own limit would
+	otherwise sit on a scarce global slot while it waited for its own. The
+	acquisition order is fixed, so the two semaphores cannot deadlock.
+	"""
+	timeout = max(0, RENDER_QUEUE_TIMEOUT_SEC)
+	deadline = time.monotonic() + timeout
+	tenant = _tenant_slots(tenant_key)
+	if not tenant.acquire(timeout=timeout):
+		raise RenderCapacityError(f"no render slot free for '{tenant_key}'")
+	try:
+		if not _RENDER_SLOTS.acquire(timeout=max(0, deadline - time.monotonic())):
+			raise RenderCapacityError("render capacity exhausted")
+		try:
+			yield
+		finally:
+			_RENDER_SLOTS.release()
+	finally:
+		tenant.release()
+
 os.makedirs(EVENTS_DIR, exist_ok=True)
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+
+# Certificate tokens minted before Phase 3 carry no club (`c`). They resolve to
+# this club during a grace period; every such resolution is logged so the log
+# going quiet is the signal the grace period can end. Set LEGACY_TOKEN_GRACE=0 to
+# reject club-less tokens outright (the cutoff).
+LEGACY_TOKEN_CLUB = "csi-aseb"
+LEGACY_TOKEN_GRACE = os.environ.get("LEGACY_TOKEN_GRACE", "1").strip().lower() not in ("0", "false", "no", "off")
 TEMPLATE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 TEMPLATE_CONTENT_TYPES = {
 	".png": "image/png",
@@ -491,17 +728,29 @@ def _event_csv_key(slug: str) -> str:
 
 # ─── Certificate template storage ─────────────────────────────────────────────
 
-def _template_object_path(slug: str, ext: str) -> str:
-	return f"{slug}/template/template{ext}"
+def _storage_event_prefix(event_slug: str, club_slug: str | None = None) -> str:
+	"""The object-store prefix for an event: <club>/<event> for a club-owned event,
+	bare <event> for a legacy (not-yet-migrated) one."""
+	return f"{club_slug}/{event_slug}" if club_slug else event_slug
+
+
+def _template_object_path(slug: str, ext: str, club_slug: str | None = None) -> str:
+	return f"{_storage_event_prefix(slug, club_slug)}/template/template{ext}"
 
 
 def _legacy_template_object_path(slug: str, ext: str) -> str:
-	"""Where templates lived before the per-event folder layout."""
+	"""Where templates lived before the per-event folder layout (legacy events only)."""
 	return f"events/{slug}/template{ext}"
 
 
-def _participants_object_path(slug: str, filename: str = "data.csv") -> str:
-	return f"{slug}/participants/{filename}"
+def _participants_object_path(slug: str, filename: str = "data.csv",
+							  club_slug: str | None = None) -> str:
+	return f"{_storage_event_prefix(slug, club_slug)}/participants/{filename}"
+
+
+def _scoped_event_dir(event_slug: str, club_slug: str | None = None) -> str:
+	"""Local fallback directory, mirroring the object-store prefix."""
+	return os.path.join(EVENTS_DIR, club_slug, event_slug) if club_slug else _event_dir(event_slug)
 
 
 def template_ext_for(slug: str, config: dict | None = None) -> str:
@@ -533,19 +782,23 @@ def has_template(slug: str, config: dict | None = None) -> bool:
 	return os.path.exists(_event_template_path(slug))
 
 
-def load_template_bytes(slug: str, config: dict | None = None) -> bytes | None:
+def load_template_bytes(slug: str, config: dict | None = None,
+						club_slug: str | None = None) -> bytes | None:
 	ext = template_ext_for(slug, config)
 	if _supabase_enabled():
-		for object_path in (_template_object_path(slug, ext),
-							_legacy_template_object_path(slug, ext)):
+		# A club event lives only in the club scheme, so there is no legacy path to
+		# fall back to; a legacy event keeps its new-then-older fallback.
+		object_paths = ((_template_object_path(slug, ext, club_slug),) if club_slug
+						else (_template_object_path(slug, ext), _legacy_template_object_path(slug, ext)))
+		for object_path in object_paths:
 			try:
 				data = _supabase_download(object_path)
 				if data:
 					return data
 			except (urlerror.URLError, TimeoutError, OSError, ValueError):
 				break
-	path = os.path.join(_event_dir(slug), f"template{ext}")
-	if not os.path.exists(path):
+	path = os.path.join(_scoped_event_dir(slug, club_slug), f"template{ext}")
+	if not os.path.exists(path) and not club_slug:
 		path = _event_template_path(slug)
 	try:
 		with open(path, "rb") as f:
@@ -554,24 +807,26 @@ def load_template_bytes(slug: str, config: dict | None = None) -> bytes | None:
 		return None
 
 
-def save_template_bytes(slug: str, data: bytes, ext: str) -> str:
+def save_template_bytes(slug: str, data: bytes, ext: str,
+						club_slug: str | None = None) -> str:
 	"""Persist a template everywhere and return its new version token."""
 	if _supabase_enabled():
 		_supabase_upload(
-			_template_object_path(slug, ext),
+			_template_object_path(slug, ext, club_slug),
 			data,
 			TEMPLATE_CONTENT_TYPES.get(ext, "application/octet-stream"),
 		)
 	# Keep a local copy too: it is the fallback when Supabase is not configured.
+	local_dir = _scoped_event_dir(slug, club_slug)
 	try:
-		os.makedirs(_event_dir(slug), exist_ok=True)
+		os.makedirs(local_dir, exist_ok=True)
 		for stale_ext in TEMPLATE_EXTENSIONS:
 			if stale_ext == ext:
 				continue
-			stale_path = os.path.join(_event_dir(slug), f"template{stale_ext}")
+			stale_path = os.path.join(local_dir, f"template{stale_ext}")
 			if os.path.exists(stale_path):
 				os.remove(stale_path)
-		with open(os.path.join(_event_dir(slug), f"template{ext}"), "wb") as f:
+		with open(os.path.join(local_dir, f"template{ext}"), "wb") as f:
 			f.write(data)
 	except OSError:
 		# A read-only filesystem is fine as long as Supabase accepted the upload.
@@ -580,21 +835,134 @@ def save_template_bytes(slug: str, data: bytes, ext: str) -> str:
 	return hashlib.sha256(data).hexdigest()[:16]
 
 
-def delete_event_objects(slug: str) -> None:
+def delete_event_objects(slug: str, club_slug: str | None = None) -> None:
 	"""Remove an event's whole folder: template, participant files, and legacy keys."""
 	if not _supabase_enabled():
 		return
-	paths = [_participants_object_path(slug)]
+	paths = [_participants_object_path(slug, club_slug=club_slug)]
 	for ext in TEMPLATE_EXTENSIONS:
-		paths.append(_template_object_path(slug, ext))
-		paths.append(_legacy_template_object_path(slug, ext))
+		paths.append(_template_object_path(slug, ext, club_slug))
+		if not club_slug:
+			paths.append(_legacy_template_object_path(slug, ext))
 	for ext in PARTICIPANT_EXTENSIONS:
-		paths.append(_participants_object_path(slug, f"source{ext}"))
+		paths.append(_participants_object_path(slug, f"source{ext}", club_slug=club_slug))
 	for object_path in paths:
 		try:
 			_supabase_delete(object_path)
 		except (urlerror.URLError, TimeoutError, OSError, ValueError):
 			continue
+
+
+def _supabase_list(prefix: str) -> list[dict]:
+	"""One level of objects under a prefix. Files carry metadata (with size);
+	folders come back with null metadata."""
+	body = json.dumps({"prefix": prefix, "limit": 1000, "offset": 0,
+					   "sortBy": {"column": "name", "order": "asc"}}).encode("utf-8")
+	url = f"{SUPABASE_URL}/storage/v1/object/list/{urlparse.quote(SUPABASE_BUCKET, safe='')}"
+	req = urlrequest.Request(url, data=body, method="POST",
+							 headers=_supabase_headers({"Content-Type": "application/json"}))
+	with urlrequest.urlopen(req, timeout=20) as response:
+		payload = json.loads(response.read())
+	return payload if isinstance(payload, list) else []
+
+
+def club_storage_bytes(club_slug: str, strict: bool = False) -> int:
+	"""Total bytes stored under a club's prefix.
+
+	The object listing is ground truth. It is summed on demand (uploads are rare
+	admin actions, not a hot path), walking the club's event/template/participant
+	folders. When Supabase is not configured, the local fallback tree is summed.
+
+	`strict=True` re-raises a listing failure instead of silently dropping that
+	subtree's bytes. The quota check uses it so a Storage outage fails closed
+	(reject the upload) rather than under-counting and admitting it; the dashboard
+	display uses the lenient default so a transient error shows a partial figure
+	instead of an error page.
+	"""
+	if not club_slug:
+		return 0
+	if not _supabase_enabled():
+		root = os.path.join(EVENTS_DIR, club_slug)
+		total = 0
+		for dirpath, _dirs, files in os.walk(root):
+			for name in files:
+				try:
+					total += os.path.getsize(os.path.join(dirpath, name))
+				except OSError:
+					pass
+		return total
+
+	total = 0
+	stack = [f"{club_slug}/"]
+	visited: set[str] = set()
+	while stack:
+		prefix = stack.pop()
+		if prefix in visited:
+			continue
+		visited.add(prefix)
+		try:
+			entries = _supabase_list(prefix)
+		except (urlerror.URLError, TimeoutError, OSError, ValueError):
+			if strict:
+				raise
+			continue
+		for entry in entries:
+			name = entry.get("name")
+			if not name:
+				continue
+			metadata = entry.get("metadata")
+			if isinstance(metadata, dict) and metadata.get("size") is not None:
+				total += int(metadata["size"])
+			else:
+				# A folder: recurse into it.
+				stack.append(f"{prefix}{name}/")
+	return total
+
+
+def _stored_object_size(object_path: str | None) -> int:
+	"""Current size in bytes of one stored object, or 0 if absent/unknown."""
+	if not object_path or not _supabase_enabled():
+		return 0
+	parent, _, leaf = object_path.rpartition("/")
+	try:
+		for entry in _supabase_list(parent + "/"):
+			if entry.get("name") == leaf:
+				meta = entry.get("metadata")
+				if isinstance(meta, dict) and meta.get("size") is not None:
+					return int(meta["size"])
+	except (urlerror.URLError, TimeoutError, OSError, ValueError):
+		return 0
+	return 0
+
+
+def quota_status(club: dict, incoming_bytes: int,
+				 replacing_path: str | None = None) -> tuple[bool, str | None]:
+	"""Whether an upload of `incoming_bytes` fits under the club's quota.
+
+	This is a soft cap, not a hard guarantee: two uploads racing can each see room
+	and both proceed, so the true usage can overshoot the cap by up to the size of
+	the concurrent uploads. Do not present it anywhere as an exact ceiling.
+
+	`replacing_path`, when the upload overwrites an existing object, is that object's
+	store path: its current bytes are freed by the upsert, so they are netted out -
+	otherwise re-uploading a same-size file near the cap is falsely rejected.
+	"""
+	cap = int(club.get("quota_bytes", db.DEFAULT_QUOTA_BYTES))
+	try:
+		used = club_storage_bytes(club["slug"], strict=True)
+	except (urlerror.URLError, TimeoutError, OSError, ValueError):
+		# Fail closed: if usage cannot be verified, do not admit the upload rather
+		# than let a club blow past the shared quota during a Storage outage.
+		return False, "Could not verify current storage usage. Please try again shortly."
+	net_used = max(0, used - _stored_object_size(replacing_path))
+	if net_used + incoming_bytes > cap:
+		remaining = max(0, cap - net_used)
+		return False, (
+			"This upload would exceed the club's storage limit "
+			f"({cap // (1024 * 1024)} MB). Used {net_used // (1024 * 1024)} MB, "
+			f"{remaining // (1024 * 1024)} MB free. Nothing was uploaded."
+		)
+	return True, None
 
 
 def decode_template(data: bytes) -> Image.Image:
@@ -610,19 +978,52 @@ def decode_template(data: bytes) -> Image.Image:
 	return image.convert("RGB")
 
 
-def get_template_image(slug: str, config: dict | None = None) -> Image.Image | None:
-	"""Decoded template, cached per (slug, template version). Returns a copy."""
-	cache_key = f"{slug}@{template_version_for(slug, config)}"
-	cached = _cache_get(_TEMPLATE_IMAGE_CACHE, cache_key)
+def decoded_image_bytes(image: Image.Image) -> int:
+	"""Roughly what a decoded image occupies: one byte per band per pixel."""
+	return image.width * image.height * len(image.getbands())
+
+
+def _template_cache_key(slug: str, version, club_slug: str | None = None) -> str:
+	"""The single source of truth for the decoded-template cache key. The club is part
+	of the key so two clubs sharing an event slug never serve each other's template; a
+	legacy (club-less) event keeps its bare key so its cache behaviour is unchanged."""
+	return f"{club_slug}/{slug}@{version}" if club_slug else f"{slug}@{version}"
+
+
+def warm_template_cache_from_bytes(slug: str, version, data: bytes,
+								   club_slug: str | None = None) -> None:
+	"""Pre-decode a freshly uploaded template into the image cache from the bytes we
+	already hold, so the first certificate render skips the storage fetch and decode.
+	Best-effort: any failure is swallowed - warming is an optimization, never required
+	for correctness, and must never fail an upload."""
+	try:
+		image = decode_template(data)
+		_TEMPLATE_IMAGE_CACHE.put(_template_cache_key(slug, version, club_slug),
+								  image, decoded_image_bytes(image))
+	except Exception:
+		pass
+
+
+def get_template_image(slug: str, config: dict | None = None,
+					   club_slug: str | None = None) -> Image.Image | None:
+	"""Decoded template, cached per (club, slug, template version). Returns a copy.
+
+	The club is part of the key: two clubs can own an event with the same slug and
+	the same template_version, and a slug-only key would serve one club's template
+	for the other's certificate. A legacy (club-less) event keeps its bare key so
+	its cache behaviour is unchanged."""
+	version = template_version_for(slug, config)
+	cache_key = _template_cache_key(slug, version, club_slug)
+	cached = _TEMPLATE_IMAGE_CACHE.get(cache_key)
 	if cached is None:
-		data = load_template_bytes(slug, config)
+		data = load_template_bytes(slug, config, club_slug)
 		if data is None:
 			return None
 		try:
 			cached = decode_template(data)
 		except Exception:
 			return None
-		_cache_put(_TEMPLATE_IMAGE_CACHE, cache_key, cached, _TEMPLATE_CACHE_MAX)
+		_TEMPLATE_IMAGE_CACHE.put(cache_key, cached, decoded_image_bytes(cached))
 	return cached.copy()
 
 
@@ -708,9 +1109,26 @@ def _load_event_config(slug: str) -> dict | None:
 			# between requests and between bulk-generation threads.
 			return copy.deepcopy(config)
 
-	# Cache miss or expired - reload from source
+	# Cache miss or expired - reload from source.
 	config = None
-	if _kv_enabled():
+
+	# Postgres is the platform's source of truth now; KV is demoted to a fallback
+	# for events not yet migrated (Phase 5). A store outage must NOT take down
+	# serving of a legacy event that still lives in KV/file, so a DatabaseUnavailable
+	# here degrades to the fallback rather than propagating - unlike the auth path,
+	# which fails closed. find_event_globally is safe here only while at most one
+	# approved club claims the slug, which holds through Phases 1-2.
+	try:
+		row = repo().find_event_globally(slug)
+	except db.DatabaseUnavailable:
+		row = None
+	if row is not None and isinstance(row.get("config"), dict):
+		config = dict(row["config"])
+		config.setdefault("slug", row["slug"])
+		config.setdefault("name", row["name"])
+		config["active"] = row["active"]
+
+	if config is None and _kv_enabled():
 		try:
 			raw = _kv_get_raw(_event_config_key(slug))
 			if raw not in (None, ""):
@@ -789,8 +1207,15 @@ def participant_text_from_upload(data: bytes, ext: str) -> tuple[str | None, str
 	return data.decode("utf-8-sig", errors="replace"), None
 
 
-def _read_event_csv_from_file(slug: str) -> str | None:
-	path = _event_csv_path(slug)
+def _csv_cache_key(slug: str, club_slug: str | None = None) -> str:
+	"""Participant caches are keyed by (club, slug). A legacy csi-aseb event keeps
+	the bare slug so its cache behaviour is unchanged; two clubs sharing an event
+	slug get distinct keys, so one club can never be served the other's roster."""
+	return f"{club_slug}/{slug}" if club_slug else slug
+
+
+def _read_event_csv_from_file(slug: str, club_slug: str | None = None) -> str | None:
+	path = os.path.join(_scoped_event_dir(slug, club_slug), "data.csv") if club_slug else _event_csv_path(slug)
 	if not os.path.exists(path):
 		return None
 	try:
@@ -800,26 +1225,29 @@ def _read_event_csv_from_file(slug: str) -> str | None:
 		return None
 
 
-def load_event_csv_text(slug: str) -> str | None:
+def load_event_csv_text(slug: str, club_slug: str | None = None) -> str | None:
 	"""
 	Participant CSV text, cached briefly because one page view reads it repeatedly.
 
-	Supabase is the store; KV is read only so events uploaded before the move keep
-	working, and the local file is the no-storage-configured fallback.
+	Supabase is the store; KV is read only (legacy events) and the local file is the
+	no-storage fallback. A club event reads from its own <club>/<event> prefix and
+	caches under a club-scoped key, so one club never sees another's participants.
 	"""
-	cached = _EVENT_CSV_CACHE.get(slug)
+	key = _csv_cache_key(slug, club_slug)
+	cached = _EVENT_CSV_CACHE.get(key)
 	if cached is not None and (time.time() - cached[1]) < _EVENT_CSV_CACHE_TTL_SEC:
 		return cached[0]
 
 	content: str | None = None
 	if _supabase_enabled():
 		try:
-			raw_bytes = _supabase_download(_participants_object_path(slug))
+			raw_bytes = _supabase_download(_participants_object_path(slug, club_slug=club_slug))
 			if raw_bytes:
 				content = raw_bytes.decode("utf-8-sig", errors="replace")
 		except (urlerror.URLError, TimeoutError, OSError, ValueError):
 			pass
-	if content is None and _kv_enabled():
+	# KV holds only legacy (club-less) events; a club event never consults it.
+	if content is None and club_slug is None and _kv_enabled():
 		try:
 			raw = _kv_get_raw(_event_csv_key(slug))
 			if isinstance(raw, str):
@@ -827,9 +1255,9 @@ def load_event_csv_text(slug: str) -> str | None:
 		except (urlerror.URLError, TimeoutError, OSError, ValueError):
 			pass
 	if content is None:
-		content = _read_event_csv_from_file(slug)
+		content = _read_event_csv_from_file(slug, club_slug)
 
-	_EVENT_CSV_CACHE[slug] = (content, time.time())
+	_EVENT_CSV_CACHE[key] = (content, time.time())
 	if len(_EVENT_CSV_CACHE) > 100:
 		_EVENT_CSV_CACHE.clear()
 	return content
@@ -988,7 +1416,8 @@ def save_event_config(slug: str, config: dict) -> None:
 			return
 
 
-def save_event_csv(slug: str, content: str, source: tuple[bytes, str] | None = None) -> None:
+def save_event_csv(slug: str, content: str, source: tuple[bytes, str] | None = None,
+				   club_slug: str | None = None) -> None:
 	"""
 	Persist the participant list.
 
@@ -996,16 +1425,20 @@ def save_event_csv(slug: str, content: str, source: tuple[bytes, str] | None = N
 	it is kept alongside the derived CSV so the organiser can download exactly
 	what they uploaded.
 	"""
+	local_dir = _scoped_event_dir(slug, club_slug)
 	try:
-		_write_event_csv_to_file(slug, content)
+		os.makedirs(local_dir, exist_ok=True)
+		with open(os.path.join(local_dir, "data.csv"), "w", encoding="utf-8", newline="") as f:
+			f.write(content)
 	except OSError:
-		if not (_supabase_enabled() or _kv_enabled()):
+		if not (_supabase_enabled() or (_kv_enabled() and not club_slug)):
 			raise
-	_EVENT_CSV_CACHE.pop(slug, None)
+	_EVENT_CSV_CACHE.pop(_csv_cache_key(slug, club_slug), None)
+	_PARTICIPANT_DATASET_CACHE.pop(_csv_cache_key(slug, club_slug), None)
 
 	if _supabase_enabled():
 		_supabase_upload(
-			_participants_object_path(slug),
+			_participants_object_path(slug, club_slug=club_slug),
 			content.encode("utf-8"),
 			PARTICIPANT_CONTENT_TYPES[".csv"],
 		)
@@ -1013,18 +1446,20 @@ def save_event_csv(slug: str, content: str, source: tuple[bytes, str] | None = N
 			raw_bytes, ext = source
 			try:
 				_supabase_upload(
-					_participants_object_path(slug, f"source{ext}"),
+					_participants_object_path(slug, f"source{ext}", club_slug=club_slug),
 					raw_bytes,
 					PARTICIPANT_CONTENT_TYPES.get(ext, "application/octet-stream"),
 				)
 			except (urlerror.URLError, TimeoutError, OSError, ValueError):
 				# Keeping the original is a convenience, not a requirement.
 				pass
-		_register_event_slug(slug)
+		if not club_slug:
+			_register_event_slug(slug)
 		return
 
-	# No Supabase configured: fall back to KV so existing deployments still work.
-	if _kv_enabled():
+	# No Supabase and a legacy event: fall back to KV so old deployments still
+	# work. Club events never touch KV - it is demoted and single-club.
+	if _kv_enabled() and not club_slug:
 		try:
 			_kv_set_raw(_event_csv_key(slug), content)
 			_register_event_slug(slug)
@@ -1032,14 +1467,16 @@ def save_event_csv(slug: str, content: str, source: tuple[bytes, str] | None = N
 			return
 
 
-def delete_event_storage(slug: str) -> None:
-	if os.path.isdir(_event_dir(slug)):
-		shutil.rmtree(_event_dir(slug))
-	delete_event_objects(slug)
+def delete_event_storage(slug: str, club_slug: str | None = None) -> None:
+	local_dir = _scoped_event_dir(slug, club_slug)
+	if os.path.isdir(local_dir):
+		shutil.rmtree(local_dir)
+	delete_event_objects(slug, club_slug)
 	# Invalidate caches for the deleted event
 	global _EVENT_CONFIG_CACHE
 	_EVENT_CONFIG_CACHE.pop(slug, None)
-	_EVENT_CSV_CACHE.pop(slug, None)
+	_EVENT_CSV_CACHE.pop(_csv_cache_key(slug, club_slug), None)
+	_PARTICIPANT_DATASET_CACHE.pop(_csv_cache_key(slug, club_slug), None)
 	if _kv_enabled():
 		try:
 			_kv_delete_key(_event_config_key(slug))
@@ -1079,28 +1516,122 @@ def parse_custom_fields(form_values: list[str]) -> list[str]:
 	return fields
 
 
-def csv_headers(slug: str) -> list[str]:
-	content = load_event_csv_text(slug)
-	if content is None:
-		return []
-	reader = csv.DictReader(content.splitlines())
-	return [normalize_value(h) for h in (reader.fieldnames or []) if normalize_value(h)]
+def csv_headers(slug: str, club_slug: str | None = None) -> list[str]:
+	return list(load_participant_dataset(slug, club_slug).columns)
 
 
-def load_csv_rows(slug: str) -> list[dict[str, str]]:
-	rows: list[dict[str, str]] = []
-	content = load_event_csv_text(slug)
-	if content is None:
-		return rows
+# ─── Participant dataset ──────────────────────────────────────────────────────
+#
+# Every page view used to re-read and re-parse the CSV several times over: the
+# team list, each dropdown column, then again on validation. At 1000 arrivals in
+# minutes that is the CSV parsed thousands of times. This parses it once per
+# distinct CSV content and hands every loader the same structure.
+#
+# It also draws the line the multi-field feature needs: values are kept BOTH
+# verbatim (what prints on the certificate - "Nimbus", "07") and normalized
+# (lowercased, for case-insensitive matching). Resolving a csv field off the
+# normalized copy would print "nimbus" and turn "07" matching into a display bug,
+# which is exactly what the plan forbids.
+
+# Keyed by slug, validated by a hash of the CSV text, so replacing the CSV yields
+# a new hash and a fresh parse with no manual invalidation needed. Upload paths
+# still evict eagerly (below) so the change shows before the text cache's TTL.
+_PARTICIPANT_DATASET_CACHE: dict[str, tuple[str, "ParticipantDataset"]] = {}
+
+
+class ParticipantDataset:
+	"""One parse of an event's participant CSV, verbatim values preserved.
+
+	raw_rows[i] and norm_rows[i] are the same row: raw for display, normalized for
+	matching. Header keys are normalized in both, so a column is looked up the same
+	way regardless of how the CSV cased its header.
+	"""
+
+	__slots__ = ("columns", "raw_rows", "norm_rows", "_column_values")
+
+	def __init__(self, columns: list[str], raw_rows: list[dict[str, str]],
+				 norm_rows: list[dict[str, str]]):
+		self.columns = columns
+		self.raw_rows = raw_rows
+		self.norm_rows = norm_rows
+		self._column_values: dict[str, list[str]] = {}
+
+	def column_values(self, column: str) -> list[str]:
+		"""Distinct verbatim values of a column, first-seen order. Memoized."""
+		col = normalize_value(column)
+		if col in self._column_values:
+			return self._column_values[col]
+		seen: set[str] = set()
+		values: list[str] = []
+		for raw, norm in zip(self.raw_rows, self.norm_rows):
+			key = norm.get(col, "")
+			raw_value = raw.get(col, "")
+			if raw_value and key not in seen:
+				seen.add(key)
+				values.append(raw_value)
+		self._column_values[col] = values
+		return values
+
+	def rows_matching(self, key: dict[str, str]) -> list[dict[str, str]]:
+		"""Raw rows whose normalized values equal every (column, value) in `key`.
+
+		`key` values are compared normalized, so matching stays case-insensitive
+		while the rows returned keep their verbatim values for display.
+		"""
+		norm_key = {normalize_value(c): normalize_value(v) for c, v in key.items()}
+		out: list[dict[str, str]] = []
+		for raw, norm in zip(self.raw_rows, self.norm_rows):
+			if all(norm.get(c, "") == v for c, v in norm_key.items()):
+				out.append(raw)
+		return out
+
+
+_EMPTY_DATASET = ParticipantDataset([], [], [])
+
+
+def _parse_participant_dataset(content: str) -> ParticipantDataset:
 	reader = csv.DictReader(content.splitlines())
+	columns = [normalize_value(h) for h in (reader.fieldnames or []) if normalize_value(h)]
+	raw_rows: list[dict[str, str]] = []
+	norm_rows: list[dict[str, str]] = []
 	for row in reader:
-		normalized_row: dict[str, str] = {}
-		for key, value in row.items():
-			normalized_key = normalize_value(key)
-			if normalized_key:
-				normalized_row[normalized_key] = normalize_value(value or "")
-		rows.append(normalized_row)
-	return rows
+		raw: dict[str, str] = {}
+		norm: dict[str, str] = {}
+		for header, value in row.items():
+			col = normalize_value(header)
+			if not col:
+				continue
+			# Verbatim except for a surrounding-whitespace trim, so a stray space
+			# in a cell does not defeat matching or print as leading padding.
+			raw[col] = (value or "").strip()
+			norm[col] = normalize_value(value or "")
+		raw_rows.append(raw)
+		norm_rows.append(norm)
+	return ParticipantDataset(columns, raw_rows, norm_rows)
+
+
+def load_participant_dataset(slug: str, club_slug: str | None = None) -> ParticipantDataset:
+	"""Parsed participant CSV for an event, cached per distinct CSV content and per
+	club, so two clubs sharing a slug never share a dataset."""
+	content = load_event_csv_text(slug, club_slug)
+	if content is None:
+		return _EMPTY_DATASET
+	key = _csv_cache_key(slug, club_slug)
+	fingerprint = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
+	cached = _PARTICIPANT_DATASET_CACHE.get(key)
+	if cached is not None and cached[0] == fingerprint:
+		return cached[1]
+	dataset = _parse_participant_dataset(content)
+	_PARTICIPANT_DATASET_CACHE[key] = (fingerprint, dataset)
+	if len(_PARTICIPANT_DATASET_CACHE) > 100:
+		_PARTICIPANT_DATASET_CACHE.clear()
+		_PARTICIPANT_DATASET_CACHE[key] = (fingerprint, dataset)
+	return dataset
+
+
+def load_csv_rows(slug: str, club_slug: str | None = None) -> list[dict[str, str]]:
+	"""Normalized rows, for matching. Same shape as before; now a single parse."""
+	return load_participant_dataset(slug, club_slug).norm_rows
 
 
 def required_headers_for_validation(validation_type: str, custom_fields: list[str]) -> set[str]:
@@ -1115,7 +1646,7 @@ def required_headers_for_validation(validation_type: str, custom_fields: list[st
 	return set()
 
 
-def build_custom_form_fields(slug: str, custom_fields: list[str], custom_dropdown_fields: list[str] | None = None) -> list[dict]:
+def build_custom_form_fields(slug: str, custom_fields: list[str], custom_dropdown_fields: list[str] | None = None, club_slug: str | None = None) -> list[dict]:
 	result: list[dict] = []
 	dropdown_set = set(custom_dropdown_fields or [])
 	for field in custom_fields:
@@ -1129,7 +1660,7 @@ def build_custom_form_fields(slug: str, custom_fields: list[str], custom_dropdow
 				"key": key,
 				"label": field.replace("_", " ").title(),
 				"is_dropdown": is_dropdown,
-				"options": load_unique_column_values(slug, field) if is_dropdown else [],
+				"options": load_unique_column_values(slug, field, club_slug) if is_dropdown else [],
 			}
 		)
 	return result
@@ -1143,152 +1674,153 @@ def validation_prompt_for_type(validation_type: str) -> str:
 	return "Registration name"
 
 
-def event_form_context(config: dict, slug: str, error: str | None = None) -> dict:
+def participant_input_fields(config: dict) -> tuple:
+	"""(primary_id, extra_fields) for the participant form.
+
+	The primary input field is the certificate's `name` field if it has one, else
+	its first input field; the big `cert_name` box on the event page fills it. Any
+	other input field gets its own labelled box, posted as field_<id>. csv/static
+	fields never appear here - they resolve server-side.
+	"""
+	input_fields = [f for f in normalize_fields(config) if f["source"] == "input"]
+	if not input_fields:
+		return None, []
+	primary_id = next((f["id"] for f in input_fields if f["id"] == "name"), input_fields[0]["id"])
+	extra = [{"id": f["id"], "label": f["label"]} for f in input_fields if f["id"] != primary_id]
+	return primary_id, extra
+
+
+def event_form_context(config: dict, slug: str, error: str | None = None,
+					   download_action: str | None = None, club_slug: str | None = None) -> dict:
 	validation_type = config.get("validation_type", "player_team")
 	custom_fields = config.get("custom_fields", [])
 	custom_dropdown_fields = config.get("custom_dropdown_fields", [])
 	validation_prompt = validation_prompt_for_type(validation_type)
 	registration_placeholder = "BL.SC.U4AIExxxxx" if validation_type == "badge_id" else f"Enter {validation_prompt.lower()}"
+	primary_id, extra_input_fields = participant_input_fields(config)
+	name_label = "Name to print on the certificate"
+	for field in normalize_fields(config):
+		if field["id"] == primary_id:
+			name_label = field["label"] or name_label
+			break
 	return {
 		"event": config,
-		"teams": load_team_names(slug) if validation_type == "player_team" else [],
-		"custom_form_fields": build_custom_form_fields(slug, custom_fields, custom_dropdown_fields),
+		"teams": load_team_names(slug, club_slug) if validation_type == "player_team" else [],
+		"custom_form_fields": build_custom_form_fields(slug, custom_fields, custom_dropdown_fields, club_slug),
 		"validation_prompt": validation_prompt,
 		"registration_placeholder": registration_placeholder,
+		"name_label": name_label,
+		"extra_input_fields": extra_input_fields,
+		# The "name to print" box only makes sense when a field is filled by participant
+		# input. When the name is read from the participants file (csv) it is pulled from
+		# the matched row, so the box is neither shown nor required.
+		"has_name_input": primary_id is not None,
+		"download_action": download_action or url_for("download_certificate", slug=slug),
 		"error": error,
 	}
 
 
-def load_valid_participants(slug: str) -> set[tuple[str, str]]:
+def load_valid_participants(slug: str, club_slug: str | None = None) -> set[tuple[str, str]]:
 	participants: set[tuple[str, str]] = set()
-	content = load_event_csv_text(slug)
-	if content is None:
-		return participants
-	reader = csv.DictReader(content.splitlines())
-	for row in reader:
-		player = normalize_value(row.get("player", ""))
-		team = normalize_value(row.get("team", ""))
+	for row in load_participant_dataset(slug, club_slug).norm_rows:
+		player, team = row.get("player", ""), row.get("team", "")
 		if player and team:
 			participants.add((player, team))
 	return participants
 
 
-def load_valid_names(slug: str) -> set[str]:
-	names: set[str] = set()
-	content = load_event_csv_text(slug)
-	if content is None:
-		return names
-	reader = csv.DictReader(content.splitlines())
-	for row in reader:
-		name = normalize_value(row.get("name", ""))
-		if name:
-			names.add(name)
-	return names
+def load_valid_names(slug: str, club_slug: str | None = None) -> set[str]:
+	return {row.get("name", "") for row in load_participant_dataset(slug, club_slug).norm_rows
+			if row.get("name", "")}
 
 
-def load_team_names(slug: str) -> list[str]:
-	content = load_event_csv_text(slug)
-	if content is None:
-		return []
-	seen: set[str] = set()
-	teams: list[str] = []
-	reader = csv.DictReader(content.splitlines())
-	for row in reader:
-		team_raw = (row.get("team", "") or "").strip()
-		key = normalize_value(team_raw)
-		if team_raw and key not in seen:
-			seen.add(key)
-			teams.append(team_raw)
-	return sorted(teams, key=lambda v: v.lower())
+def load_team_names(slug: str, club_slug: str | None = None) -> list[str]:
+	return sorted(load_participant_dataset(slug, club_slug).column_values("team"),
+				  key=lambda v: v.lower())
 
 
-def load_unique_column_values(slug: str, column: str) -> list[str]:
-	content = load_event_csv_text(slug)
-	if content is None:
-		return []
-	reader = csv.DictReader(content.splitlines())
-	target = normalize_value(column)
-	seen: set[str] = set()
-	values: list[str] = []
-	for row in reader:
-		for key, value in row.items():
-			if normalize_value(key) != target:
-				continue
-			raw_value = (value or "").strip()
-			normalized = normalize_value(raw_value)
-			if raw_value and normalized not in seen:
-				seen.add(normalized)
-				values.append(raw_value)
-			break
-	return values
+def load_unique_column_values(slug: str, column: str, club_slug: str | None = None) -> list[str]:
+	return load_participant_dataset(slug, club_slug).column_values(column)
 
 
-def validate_participant_submission(slug: str, config: dict, form_data) -> str | None:
+def validate_participant_submission(slug: str, config: dict, form_data, club_slug: str | None = None) -> tuple[list[dict[str, str]] | None, str | None]:
+	"""Validate a submission and return the rows it matched.
+
+	Returns ``(matched_rows, None)`` on success and ``(None, error)`` on failure.
+	``matched_rows`` holds every raw (verbatim) CSV row the submission matched, so a
+	``csv`` field can be resolved against them and, when a coarse key like team-only
+	matches several people, disagreement can be detected instead of silently taking
+	the first row. ``validation_type == "none"`` performs no match and returns
+	``([], None)`` - a valid submission with no row behind it.
+
+	The single ``None``-vs-list return is what separates failure from a legitimately
+	empty match: ``None`` is always an error, a list (even empty) is always success.
+	"""
 	validation_type = config.get("validation_type", "player_team")
 	custom_fields: list[str] = config.get("custom_fields", [])
 
 	if validation_type == "none":
-		return None
+		return [], None
 
-	# Parsed lazily: player_team and name_only use their own lookups below.
-	rows: list[dict[str, str]] | None = None
-
-	def csv_rows() -> list[dict[str, str]]:
-		nonlocal rows
-		if rows is None:
-			rows = load_csv_rows(slug)
-		return rows
+	dataset = load_participant_dataset(slug, club_slug)
 
 	if validation_type == "player_team":
 		registration_name = normalize_value(form_data.get("registration_name", ""))
 		team_name = normalize_value(form_data.get("team_name", ""))
 		if not registration_name or not team_name:
-			return "Please fill all fields."
-		if (registration_name, team_name) not in load_valid_participants(slug):
-			return "Invalid player or team name."
-		return None
+			return None, "Please fill all fields."
+		matched = dataset.rows_matching({"player": registration_name, "team": team_name})
+		if not matched:
+			return None, "Invalid player or team name."
+		return matched, None
 
 	if validation_type == "name_only":
 		registration_name = normalize_value(form_data.get("registration_name", ""))
 		if not registration_name:
-			return "Please fill all fields."
-		if registration_name not in load_valid_names(slug):
-			return "Name not found in participant list."
-		return None
+			return None, "Please fill all fields."
+		matched = dataset.rows_matching({"name": registration_name})
+		if not matched:
+			return None, "Name not found in participant list."
+		return matched, None
 
 	if validation_type == "email":
 		registration_email = normalize_value(form_data.get("registration_name", ""))
 		if not registration_email:
-			return "Please fill all fields."
-		if not any(row.get("email", "") == registration_email for row in csv_rows()):
-			return "Email not found in participant list."
-		return None
+			return None, "Please fill all fields."
+		matched = dataset.rows_matching({"email": registration_email})
+		if not matched:
+			return None, "Email not found in participant list."
+		return matched, None
 
 	if validation_type == "badge_id":
 		registration_id = normalize_value(form_data.get("registration_name", ""))
 		if not registration_id:
-			return "Please fill all fields."
-		for row in csv_rows():
-			if row.get("roll_no", "") == registration_id or row.get("id", "") == registration_id or row.get("badge_id", "") == registration_id or row.get("badge_number", "") == registration_id:
-				return None
-		return "Roll No not found in participant list."
+			return None, "Please fill all fields."
+		# An id may live under any of these headers, so this is an OR across columns
+		# rather than a single-key match - kept exactly as before.
+		id_columns = ("roll_no", "id", "badge_id", "badge_number")
+		matched = [raw for raw, norm in zip(dataset.raw_rows, dataset.norm_rows)
+				   if any(norm.get(col, "") == registration_id for col in id_columns)]
+		if not matched:
+			return None, "Roll No not found in participant list."
+		return matched, None
 
 	if validation_type == "custom":
 		if not custom_fields:
-			return "Custom validation fields are not configured by admin."
-		form_fields = build_custom_form_fields(slug, custom_fields)
+			return None, "Custom validation fields are not configured by admin."
+		form_fields = build_custom_form_fields(slug, custom_fields, club_slug=club_slug)
 		expected: dict[str, str] = {}
 		for field in form_fields:
 			value = normalize_value(form_data.get(f"custom_{field['key']}", ""))
 			if not value:
-				return "Please fill all fields."
+				return None, "Please fill all fields."
 			expected[field["column"]] = value
-		for row in csv_rows():
-			if all(row.get(col, "") == val for col, val in expected.items()):
-				return None
-		return "Details not found in participant list."
+		matched = dataset.rows_matching(expected)
+		if not matched:
+			return None, "Details not found in participant list."
+		return matched, None
 
-	return "Unsupported validation type configured for this event."
+	return None, "Unsupported validation type configured for this event."
 
 
 # ─── Certificate helpers ──────────────────────────────────────────────────────
@@ -1329,13 +1861,313 @@ def certificate_render_settings(config: dict) -> dict:
 	}
 
 
-def encode_certificate(image: Image.Image, variant: str = "download") -> tuple[bytes, str]:
+# --- Certificate fields -------------------------------------------------------
+#
+# A certificate carries up to five text fields, each with its own placement and
+# type. A field's `source` decides where its printed value comes from and, more
+# importantly, who controls it:
+#
+#   input  - the participant types it (as the name always has been)
+#   csv    - read from the row they validated against; they cannot change it
+#   static - a fixed string the club set on the event
+#
+# Only `input` is participant-controlled. A `position` or `points` field must be
+# `csv` or `static`, or a participant awards themselves whatever they like - that
+# distinction is the whole point of the feature, enforced at resolve time below.
+
+MAX_FIELDS = 5
+FIELD_SOURCES = ("input", "csv", "static")
+FIELD_ALIGNS = ("left", "center", "right")
+FIELD_OVERFLOWS = ("shrink", "truncate")
+_ALIGN_ANCHORS = {"left": "lm", "center": "mm", "right": "rm"}
+_TRUNCATE_ELLIPSIS = "\u2026"
+
+
+def _coerce_color(raw) -> list[int]:
+	try:
+		channels = [max(0, min(255, int(c))) for c in raw][:3]
+	except (TypeError, ValueError):
+		return [50, 34, 24]
+	return channels if len(channels) == 3 else [50, 34, 24]
+
+
+def _parse_int_value(value, fallback: int) -> int:
+	try:
+		return max(0, int(value))
+	except (TypeError, ValueError):
+		return fallback
+
+
+def _legacy_name_field(config: dict) -> dict:
+	"""Synthesize the single input field an event carried before fields existed.
+
+	`max_width` stays None so no measurement happens and the draw is the exact
+	anchored call the old renderer made - existing events must stay byte-identical
+	until a club edits them.
+	"""
+	return {
+		"id": "name",
+		"label": "Name",
+		"source": "input",
+		"column": "",
+		"value": "",
+		"x": _parse_int_value(config.get("text_x"), 1789),
+		"y": _parse_int_value(config.get("text_y"), 1440),
+		"font_size": _parse_int_value(config.get("font_size"), 100),
+		"font_color": _coerce_color(config.get("font_color", [50, 34, 24])),
+		"font_key": normalize_font_key(config.get("font_key"), DEFAULT_FONT_KEY),
+		"align": "center",
+		"max_width": None,
+		"overflow": "shrink",
+		"depends_on": None,
+	}
+
+
+def _normalize_one_field(raw: dict, index: int, used_ids: set) -> dict | None:
+	if not isinstance(raw, dict):
+		return None
+	source = str(raw.get("source", "")).strip().lower()
+	if source not in FIELD_SOURCES:
+		source = "input"
+
+	field_id = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("id", "")).strip().lower()).strip("_")
+	if not field_id:
+		field_id = "field_%d" % (index + 1)
+	while field_id in used_ids:
+		field_id = "%s_%d" % (field_id, index + 1)
+	used_ids.add(field_id)
+
+	align = str(raw.get("align", "center")).strip().lower()
+	if align not in FIELD_ALIGNS:
+		align = "center"
+	overflow = str(raw.get("overflow", "shrink")).strip().lower()
+	if overflow not in FIELD_OVERFLOWS:
+		overflow = "shrink"
+
+	max_width_raw = raw.get("max_width")
+	max_width = None
+	if max_width_raw not in (None, "", 0, "0"):
+		parsed = _parse_int_value(max_width_raw, 0)
+		max_width = parsed if parsed > 0 else None
+
+	# depends_on is reserved for the dependent-dropdown feature (0.5b). It is
+	# accepted and carried through now so the schema is genuinely frozen, and
+	# ignored everywhere in 0.5a. Kept only when it names another field.
+	depends_on_raw = raw.get("depends_on")
+	depends_on = str(depends_on_raw).strip().lower() or None if depends_on_raw else None
+
+	return {
+		"id": field_id,
+		"label": str(raw.get("label", "") or field_id).strip() or field_id,
+		"source": source,
+		"column": normalize_value(str(raw.get("column", ""))) if source == "csv" else "",
+		"value": str(raw.get("value", "")) if source == "static" else "",
+		"x": _parse_int_value(raw.get("x"), 0),
+		"y": _parse_int_value(raw.get("y"), 0),
+		"font_size": max(1, _parse_int_value(raw.get("font_size"), 100)),
+		"font_color": _coerce_color(raw.get("font_color", [50, 34, 24])),
+		"font_key": normalize_font_key(raw.get("font_key"), DEFAULT_FONT_KEY),
+		"align": align,
+		"max_width": max_width,
+		"overflow": overflow,
+		"depends_on": depends_on,
+	}
+
+
+def normalize_fields(config: dict) -> list:
+	"""The event's fields as a clean, capped list, always render-safe.
+
+	An event with no `fields` synthesizes one input field from the legacy scalars,
+	so old configs keep rendering byte-identically. A stored list is normalized and
+	capped at MAX_FIELDS - a hand-edited or migrated config with more is truncated
+	rather than trusted; the editor (0.5b) rejects an over-long list at save with a
+	message. `depends_on` is validated as reserved and otherwise left inert.
+	"""
+	raw_fields = config.get("fields")
+	if not isinstance(raw_fields, list) or not raw_fields:
+		return [_legacy_name_field(config)]
+
+	fields = []
+	used_ids = set()
+	for index, raw in enumerate(raw_fields):
+		if len(fields) >= MAX_FIELDS:
+			break
+		normalized = _normalize_one_field(raw, index, used_ids)
+		if normalized is not None:
+			fields.append(normalized)
+	# Drop any depends_on pointing at a field that did not survive normalization.
+	valid_ids = {f["id"] for f in fields}
+	for field in fields:
+		if field["depends_on"] not in valid_ids:
+			field["depends_on"] = None
+	return fields or [_legacy_name_field(config)]
+
+
+def _json_for_script(value) -> str:
+	"""json.dumps escaped so it is safe to embed inside a <script> block: a CSV cell
+	containing "</script>" or a lone "<" cannot break out of the tag."""
+	return (json.dumps(value)
+			.replace("<", "\u003c").replace(">", "\u003e").replace("&", "\u0026"))
+
+
+def validate_fields_payload(slug: str, raw_fields, club_slug: str | None = None) -> tuple:
+	"""Validate a fields list submitted by the editor. (fields, None) or (None, error).
+
+	This is the server-side gate the plan calls for: it REJECTS rather than silently
+	coerces, so a broken or over-long list never reaches storage. It is the third of
+	the three cap-enforcement points (editor disables Add at five, mint refuses to
+	resolve more than five, and this rejects a longer list on save).
+	"""
+	if not isinstance(raw_fields, list):
+		return None, "No fields were submitted."
+	if not raw_fields:
+		return None, "A certificate needs at least one field."
+	if len(raw_fields) > MAX_FIELDS:
+		return None, "A certificate can have at most %d fields." % MAX_FIELDS
+
+	columns = set(csv_headers(slug, club_slug))
+	fields = []
+	used_ids = set()
+	for index, raw in enumerate(raw_fields):
+		if not isinstance(raw, dict):
+			return None, "Field %d is not valid." % (index + 1)
+		source = str(raw.get("source", "")).strip().lower()
+		if source not in FIELD_SOURCES:
+			return None, "Field %d has an unknown source." % (index + 1)
+		normalized = _normalize_one_field(raw, index, used_ids)
+		label = normalized["label"]
+		if source == "csv":
+			if not normalized["column"]:
+				return None, 'The field "%s" needs a column from the participants file.' % label
+			if columns and normalized["column"] not in columns:
+				return None, ('The field "%s" refers to a column ("%s") that is not in '
+							  "the uploaded participants file." % (label, normalized["column"]))
+			if not columns:
+				return None, ('The field "%s" reads from the participants file, but no '
+							  "file has been uploaded yet." % label)
+		fields.append(normalized)
+	# depends_on can only point at a field that exists in this same list.
+	valid_ids = {f["id"] for f in fields}
+	for field in fields:
+		if field["depends_on"] not in valid_ids:
+			field["depends_on"] = None
+	return fields, None
+
+
+def resolve_field_values(fields: list, matched_rows: list,
+						 inputs: dict) -> tuple:
+	"""Resolve every field to its printed string. (values, None) or (None, error).
+
+	`csv` values come verbatim from the matched rows; when a coarse key matched
+	several people and a `csv` field disagrees between them, the field is ambiguous
+	and this refuses rather than silently printing the first row's value. `input`
+	values come only from `inputs` - a csv or static field can never be fed from
+	participant input, which is the security boundary the feature exists to draw.
+	"""
+	values = {}
+	for field in fields[:MAX_FIELDS]:
+		source = field["source"]
+		if source == "input":
+			values[field["id"]] = (inputs.get(field["id"], "") or "").strip()
+		elif source == "static":
+			values[field["id"]] = field["value"]
+		else:  # csv
+			column = field["column"]
+			distinct = {row.get(column, "") for row in matched_rows}
+			if len(distinct) > 1:
+				return None, (
+					"Please also select your name so \u201c%s\u201d can be filled in "
+					"\u2014 it differs between the matching entries." % field["label"]
+				)
+			values[field["id"]] = matched_rows[0].get(column, "") if matched_rows else ""
+	return values, None
+
+
+def resolved_fields_for_render(config: dict, values: dict) -> list:
+	"""Pair each normalized field with the value the token carried for it."""
+	fields = normalize_fields(config)
+	for field in fields:
+		field["text"] = values.get(field["id"], "")
+	return fields
+
+
+def display_name(values: dict) -> str:
+	"""The name to show in headings and download filenames: the name field, or the
+	first non-empty value if this event has no field called `name`."""
+	if values.get("name"):
+		return values["name"]
+	return next((v for v in values.values() if v), "")
+
+
+def _fit_text(draw, text: str, field: dict, font):
+	"""Apply a field's max_width: shrink the font until it fits, or truncate.
+
+	Returns the text and font to actually draw. No-op when the text already fits or
+	the field has no max_width, so an unconstrained field costs no measurement.
+	"""
+	max_width = field["max_width"]
+	if not max_width or not text:
+		return text, font
+	if draw.textlength(text, font=font) <= max_width:
+		return text, font
+	if field["overflow"] == "truncate":
+		clipped = text
+		while len(clipped) > 1 and draw.textlength(clipped + _TRUNCATE_ELLIPSIS, font=font) > max_width:
+			clipped = clipped[:-1]
+		return clipped + _TRUNCATE_ELLIPSIS, font
+	# shrink
+	size = field["font_size"]
+	while size > 8 and draw.textlength(text, font=font) > max_width:
+		size = max(8, int(size * 0.94))
+		font = get_font(size, field["font_key"])
+	return text, font
+
+
+def draw_fields_on_image(image: Image.Image, fields: list) -> None:
+	"""Draw every field (each carrying its resolved `text`) onto the template.
+
+	A single input field with center align and no max_width takes the same anchored
+	draw call the old single-name renderer used, so a legacy event is byte-identical.
+	"""
+	draw = ImageDraw.Draw(image)
+	for field in fields:
+		text = field.get("text", "")
+		if not text:
+			continue
+		font = get_font(field["font_size"], field["font_key"])
+		color = tuple(field["font_color"])
+		position = (field["x"], field["y"])
+		if isinstance(font, ImageFont.FreeTypeFont):
+			text, font = _fit_text(draw, text, field, font)
+			draw.text(position, text, fill=color, font=font,
+					  anchor=_ALIGN_ANCHORS.get(field["align"], "mm"))
+		else:
+			# load_default() is the no-TTF fallback and does not support anchor=.
+			draw.text(position, text, fill=color, font=font)
+
+
+def normalize_download_format(value: str | None,
+							  fallback: str = DEFAULT_DOWNLOAD_FORMAT) -> str:
+	"""Coerce a stored or submitted download format to one we actually encode."""
+	candidate = (value or "").strip().lower()
+	if candidate in ("jpeg", "jpg"):
+		return "jpeg"
+	if candidate == "png":
+		return "png"
+	return fallback if fallback in DOWNLOAD_FORMATS else DEFAULT_DOWNLOAD_FORMAT
+
+
+def encode_certificate(image: Image.Image, variant: str = "download",
+					   download_format: str | None = None) -> tuple[bytes, str]:
 	"""
 	Encode a rendered certificate. Returns (bytes, mimetype).
 
 	"preview" is what the browser shows in an <img>: downscaled and JPEG, because
 	nobody looks at 3508 px on a phone and the full-size PNG is ~2.5 MB.
-	"download" is the real artifact: full resolution PNG.
+	"download" is the real artifact, at full resolution, in the event's format.
+
+	A template with real alpha is always PNG whatever the event asks for: JPEG has
+	no alpha channel, so the transparency would come back as a black background.
 	"""
 	has_alpha = image.mode in ("RGBA", "LA")
 	if variant == "preview":
@@ -1346,49 +2178,87 @@ def encode_certificate(image: Image.Image, variant: str = "download") -> tuple[b
 			output = BytesIO()
 			image.save(output, format="JPEG", quality=PREVIEW_JPEG_QUALITY)
 			return output.getvalue(), "image/jpeg"
+	elif not has_alpha and normalize_download_format(download_format) == "jpeg":
+		output = BytesIO()
+		image.save(output, format="JPEG", quality=DOWNLOAD_JPEG_QUALITY,
+				   subsampling=DOWNLOAD_JPEG_SUBSAMPLING)
+		return output.getvalue(), "image/jpeg"
 	output = BytesIO()
 	image.save(output, format="PNG", compress_level=DOWNLOAD_PNG_COMPRESS_LEVEL)
 	return output.getvalue(), "image/png"
 
 
-def render_certificate(slug: str, cert_name: str, config: dict,
-					   variant: str = "download") -> tuple[bytes, str, str] | None:
+def render_certificate(slug: str, cert_values, config: dict,
+					   variant: str = "download",
+					   tenant_key: str | None = None,
+					   club_slug: str | None = None) -> tuple[bytes, str, str] | None:
 	"""
 	Render a certificate on demand and return (image_bytes, etag, mimetype).
 
-	Nothing is written to disk: the template plus the event config plus the name is
-	everything needed to reproduce the image, so any worker can serve any link.
-	The etag covers the template version, every render setting, and the variant, so
-	replacing a template or moving the text produces a new etag instead of a stale
-	cache hit.
+	`cert_values` is the field values to print: a dict {field_id: text}, or a bare
+	string for the common single-name case (treated as {"name": text}). Nothing is
+	written to disk - template plus config plus these values reproduce the image on
+	any worker.
+
+	The etag covers the template version, the download format, the variant, and
+	EVERY field's placement, type, and resolved value - so moving or restyling one
+	field, or changing another field's value, all produce a new etag instead of a
+	stale hit that would serve the other fields wrong.
+
+	Raises RenderCapacityError if no render slot comes free in time. Returns None
+	only when the event has no usable template - the caller must not conflate the
+	two: one is a 503, the other a 404.
 	"""
-	settings = certificate_render_settings(config)
-	fingerprint = json.dumps(
-		{
-			"slug": slug,
-			"name": cert_name,
-			"template": template_version_for(slug, config),
-			"settings": settings,
-			"variant": variant,
-		},
-		sort_keys=True,
-		separators=(",", ":"),
-	)
+	values = {"name": cert_values} if isinstance(cert_values, str) else dict(cert_values or {})
+	fields = resolved_fields_for_render(config, values)
+	# The requested format, not the resolved one - resolving needs the decoded
+	# image, and the request is what varies. Alpha is already covered by the
+	# template version, so the pair still determines the bytes uniquely.
+	download_format = normalize_download_format(config.get("download_format"))
+	fingerprint_data = {
+		"slug": slug,
+		"template": template_version_for(slug, config),
+		"variant": variant,
+		"format": download_format if variant == "download" else "preview",
+		"fields": [
+			{
+				"id": f["id"], "text": f["text"], "x": f["x"], "y": f["y"],
+				"font_size": f["font_size"], "font_color": f["font_color"],
+				"font_key": f["font_key"], "align": f["align"],
+				"max_width": f["max_width"], "overflow": f["overflow"],
+			}
+			for f in fields
+		],
+	}
+	# Only added for club events, so a legacy event's etag is byte-for-byte what it
+	# was before clubs existed - but two clubs sharing a slug get distinct etags,
+	# so one can never be served the other's cached render.
+	if club_slug:
+		fingerprint_data["club"] = club_slug
+	fingerprint = json.dumps(fingerprint_data, sort_keys=True, separators=(",", ":"))
 	etag = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
 
+	# Checked before the semaphore: a cache hit costs microseconds and must never
+	# queue behind someone else's 400 ms encode.
 	cached = _cache_get(_RENDERED_CERT_CACHE, etag)
 	if cached is not None:
 		return cached
 
-	image = get_template_image(slug, config)
-	if image is None:
-		return None
+	with render_slot(tenant_key or club_slug or slug):
+		# Re-checked inside the slot: whoever we queued behind may have been
+		# rendering this very certificate.
+		cached = _cache_get(_RENDERED_CERT_CACHE, etag)
+		if cached is not None:
+			return cached
 
-	metadata = dict(settings)
-	metadata["cert_name"] = cert_name
-	draw_name_on_image(image, metadata)
+		image = get_template_image(slug, config, club_slug)
+		if image is None:
+			return None
 
-	image_bytes, mimetype = encode_certificate(image, variant)
+		draw_fields_on_image(image, fields)
+
+		image_bytes, mimetype = encode_certificate(image, variant, download_format)
+
 	result = (image_bytes, etag, mimetype)
 	_cache_put(_RENDERED_CERT_CACHE, etag, result, _RENDER_CACHE_MAX)
 	return result
@@ -1407,11 +2277,28 @@ def _cert_serializer() -> URLSafeSerializer:
 	return URLSafeSerializer(app.secret_key, salt=_CERT_TOKEN_SALT)
 
 
-def make_cert_token(slug: str, cert_name: str) -> str:
-	return _cert_serializer().dumps({"s": slug, "n": cert_name})
+def make_cert_token(slug: str, cert_values, club_slug: str | None = None) -> str:
+	"""Mint a link carrying the club, the slug, and every field's resolved value.
+
+	The club is signed into the token, so the club is never taken from an unsigned
+	URL segment: a token minted for one club cannot be replayed against another.
+	`cert_values` is a {field_id: text} map, or a bare string (stored as {"name": …}).
+	"""
+	values = {"name": cert_values} if isinstance(cert_values, str) else dict(cert_values or {})
+	values = {str(k): str(v) for k, v in list(values.items())[:MAX_FIELDS]}
+	payload = {"s": slug, "v": values}
+	if club_slug:
+		payload["c"] = club_slug
+	return _cert_serializer().dumps(payload)
 
 
-def read_cert_token(token: str) -> tuple[str, str] | None:
+def read_cert_token(token: str) -> tuple[str | None, str, dict] | None:
+	"""Return (club_slug_or_None, slug, {field_id: text}) or None.
+
+	Tokens carry `c` (club), `s` (slug), `v` (values). A token with no `c` is a
+	pre-Phase-3 legacy link; the caller decides whether the grace period still
+	honours it. Pre-0.5 tokens carry `n` (a single name) instead of `v`.
+	"""
 	try:
 		payload = _cert_serializer().loads(token)
 	except BadSignature:
@@ -1419,13 +2306,24 @@ def read_cert_token(token: str) -> tuple[str, str] | None:
 	if not isinstance(payload, dict):
 		return None
 	slug = str(payload.get("s", ""))
-	cert_name = str(payload.get("n", ""))
-	if not safe_slug(slug) or not cert_name:
+	if not safe_slug(slug):
 		return None
-	return slug, cert_name
+	club = payload.get("c")
+	club_slug = str(club) if club else None
+	if club_slug is not None and not _safe_club_slug(club_slug):
+		return None
+	raw_values = payload.get("v")
+	if isinstance(raw_values, dict):
+		values = {str(k): str(v) for k, v in raw_values.items()}
+	else:
+		name = str(payload.get("n", ""))
+		values = {"name": name} if name else {}
+	if not any(v for v in values.values()):
+		return None
+	return club_slug, slug, values
 
 
-def _legacy_cert_record(cert_id: str) -> tuple[str, str] | None:
+def _legacy_cert_record(cert_id: str) -> tuple[str | None, str, dict] | None:
 	"""Resolve a pre-token certificate id from its on-disk metadata file."""
 	path = _cert_metadata_path(cert_id)
 	if not os.path.exists(path):
@@ -1441,10 +2339,11 @@ def _legacy_cert_record(cert_id: str) -> tuple[str, str] | None:
 	cert_name = str(metadata.get("cert_name", ""))
 	if not safe_slug(slug) or not cert_name:
 		return None
-	return slug, cert_name
+	# Pre-token disk records predate clubs, so they are club-less (grace applies).
+	return None, slug, {"name": cert_name}
 
 
-def resolve_cert_token(token: str) -> tuple[str, str] | None:
+def resolve_cert_token(token: str) -> tuple[str | None, str, dict] | None:
 	"""Accept a signed token, or a legacy 32-hex id still sitting on local disk."""
 	resolved = read_cert_token(token)
 	if resolved is not None:
@@ -1472,13 +2371,15 @@ def draw_name_on_image(image: Image.Image, metadata: dict) -> None:
 		draw.text(position, text, fill=color, font=font)
 
 
-def safe_download_name(name: str, slug: str) -> str:
+def safe_download_name(name: str, slug: str, mimetype: str = "image/png") -> str:
 	cleaned = re.sub(r"[^A-Za-z0-9 _-]", "", (name or "").strip())
 	cleaned = re.sub(r"\s+", "-", cleaned)
 	cleaned = cleaned.strip("-")
 	if not cleaned:
 		cleaned = f"{slug}-certificate"
-	return f"{cleaned}.png"
+	# The extension follows what was actually encoded, not what the event asked
+	# for: an alpha template served as PNG must not be handed over named .jpg.
+	return f"{cleaned}{DOWNLOAD_MIMETYPE_EXTENSIONS.get(mimetype, '.png')}"
 
 
 def _has_image_magic(data: bytes, ext: str) -> bool:
@@ -1545,6 +2446,30 @@ def build_preview_metadata(event_config: dict, cert_name: str | None = None) -> 
 	}
 
 
+# A "Suggest values" dropdown publishes every distinct value of a column to the
+# unauthenticated event page. For a team column that is a short, intended list;
+# for a name, email, or roll-number column it is the entire roster. We cannot
+# know a column's contents from its header alone, so this is a heuristic that
+# decides how loudly to warn - never a silent block. The admin still chooses.
+_PERSON_LEVEL_HINTS = (
+	"name", "email", "mail", "phone", "mobile", "contact",
+	"roll", "reg", "registration", "id", "player", "student",
+	"participant", "member", "user", "person", "usn", "prn",
+)
+
+
+def looks_person_level(column: str) -> bool:
+	"""True when a column header suggests per-person data that would leak a roster."""
+	token = re.sub(r"[^a-z0-9]+", " ", (column or "").lower())
+	words = token.split()
+	for hint in _PERSON_LEVEL_HINTS:
+		# Whole-word match, so "team" does not trip on "eam" and "id" does not
+		# fire inside "video". A trailing "team_id" still matches on the "id" word.
+		if hint in words:
+			return True
+	return False
+
+
 @app.context_processor
 def inject_style_context() -> dict:
 	return {
@@ -1553,6 +2478,7 @@ def inject_style_context() -> dict:
 		# A callable, so only templates that actually render a form mint a token.
 		"csrf_token": csrf_token,
 		"validation_type_labels": VALIDATION_TYPE_LABELS,
+		"looks_person_level": looks_person_level,
 	}
 
 
@@ -1618,21 +2544,60 @@ def require_admin(f):
 	return decorated
 
 
+# The existing single-password gate is the SUPERADMIN surface now: it approves
+# clubs and (through Phase 5) still manages the legacy csi-aseb events. A club
+# session (club_id) can never reach it, and it can never reach a club dashboard -
+# the two are keyed on different session fields, never shared.
+require_superadmin = require_admin
+
+
+def require_club(f):
+	"""Gate a club-scoped route. A pending club is allowed in to configure; only a
+	suspended or vanished club is bounced. Sets g.club for the handler."""
+	@wraps(f)
+	def decorated(*args, **kwargs):
+		club_id = session.get("club_id")
+		if not club_id:
+			return redirect(url_for("club_login"))
+		club = repo().get_club_by_id(club_id)
+		if club is None or club["status"] == "suspended":
+			session.pop("club_id", None)
+			return redirect(url_for("club_login"))
+		g.club = club
+		return f(*args, **kwargs)
+	return decorated
+
+
 # ─── Public routes ────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def home():
-	return render_template("index.html", events=load_all_events(active_only=True))
+	# Reflect an existing session so a signed-in club/admin gets a straight path to
+	# their dashboard. The landing page is public, so a database hiccup degrades to
+	# the logged-out view rather than 503-ing the whole page.
+	club = None
+	club_id = session.get("club_id")
+	if club_id:
+		try:
+			club = repo().get_club_by_id(club_id)
+		except db.DatabaseUnavailable:
+			club = None
+		if club is not None and club["status"] == "suspended":
+			club = None
+	return render_template("index.html", club=club,
+						   admin_logged_in=bool(session.get("admin_logged_in")))
 
 
 @app.route("/events/<slug>", methods=["GET"])
 def event_page(slug: str):
+	# Live links to the old flat URL survive: redirect to the club-scoped URL, but
+	# only when csi-aseb actually has this event. A 301 to a page that 404s would
+	# be cached by the browser and become very hard to undo.
 	if not safe_slug(slug):
-		return redirect(url_for("home"))
-	config = load_event(slug)
-	if config is None or not config.get("active", False):
-		return redirect(url_for("home"))
-	return render_template("event.html", **event_form_context(config, slug, None))
+		abort(404)
+	if resolve_public_event(LEGACY_TOKEN_CLUB, slug, require_active=True) is None:
+		abort(404)
+	return redirect(url_for("club_event_page", club_slug=LEGACY_TOKEN_CLUB, event_slug=slug), code=301)
 
 
 @app.route("/events/<slug>/download", methods=["POST"])
@@ -1643,28 +2608,232 @@ def download_certificate(slug: str):
 	if config is None or not config.get("active", False):
 		return redirect(url_for("home"))
 	validation_type = config.get("validation_type", "player_team")
+	primary_id, _ = participant_input_fields(config)
 	cert_name = (request.form.get("cert_name", "") or "").strip()
-	if not cert_name:
+	# cert_name is only needed when a field is filled by participant input; a
+	# csv-sourced name is read from the matched row, so it is not asked for.
+	if primary_id and not cert_name:
 		return render_template("event.html", **event_form_context(config, slug, "Please fill all fields.")), 400
-	validation_error = validate_participant_submission(slug, config, request.form)
+	matched_rows, validation_error = validate_participant_submission(slug, config, request.form)
 	if validation_error:
 		return render_template("event.html", **event_form_context(config, slug, validation_error)), 400
 	if not has_template(slug, config):
 		return render_template("event.html", **event_form_context(config, slug, "Certificate template not found on server.")), 500
+
+	# Resolve every field to its printed value. Input fields come from the form -
+	# the primary name from `cert_name`, any additional input field from field_<id>.
+	# csv and static fields resolve server-side and are never taken from the form.
+	fields = normalize_fields(config)
+	inputs = {}
+	for field in fields:
+		if field["source"] == "input":
+			posted = request.form.get("field_" + field["id"])
+			inputs[field["id"]] = (posted or "").strip()
+	# The primary name box (cert_name) fills the primary input field unless that
+	# field already got a dedicated field_<id> value.
+	if primary_id and not inputs.get(primary_id):
+		inputs[primary_id] = cert_name
+	values, resolve_error = resolve_field_values(fields, matched_rows, inputs)
+	if resolve_error:
+		return render_template("event.html", **event_form_context(config, slug, resolve_error)), 400
+
 	# The image is rendered on demand from the token, so this POST stays cheap.
-	return redirect(url_for("preview_page", token=make_cert_token(slug, cert_name)))
+	# The legacy flat route serves csi-aseb, so its token names that club.
+	return redirect(url_for("preview_page", token=make_cert_token(slug, values, club_slug=LEGACY_TOKEN_CLUB)))
 
 
-def _certificate_from_token(token: str) -> tuple[str, str, dict] | None:
-	"""Resolve a certificate link to (slug, printed name, live event config)."""
+@app.route("/c/<club_slug>/<event_slug>", methods=["GET"])
+def club_event_page(club_slug: str, event_slug: str):
+	resolved = resolve_public_event(club_slug, event_slug, require_active=True)
+	if resolved is None:
+		abort(404)
+	config, storage_club = resolved
+	action = url_for("club_download_certificate", club_slug=club_slug, event_slug=event_slug)
+	return render_template("event.html",
+						   **event_form_context(config, event_slug, None, download_action=action,
+												club_slug=storage_club))
+
+
+@app.route("/c/<club_slug>/<event_slug>/download", methods=["POST"])
+def club_download_certificate(club_slug: str, event_slug: str):
+	resolved = resolve_public_event(club_slug, event_slug, require_active=True)
+	if resolved is None:
+		abort(404)
+	config, storage_club = resolved
+	action = url_for("club_download_certificate", club_slug=club_slug, event_slug=event_slug)
+
+	def form_error(message, status=400):
+		return render_template("event.html",
+							   **event_form_context(config, event_slug, message, download_action=action,
+													club_slug=storage_club)), status
+
+	primary_id, _ = participant_input_fields(config)
+	cert_name = (request.form.get("cert_name", "") or "").strip()
+	if primary_id and not cert_name:
+		return form_error("Please fill all fields.")
+	matched_rows, validation_error = validate_participant_submission(event_slug, config, request.form, club_slug=storage_club)
+	if validation_error:
+		return form_error(validation_error)
+	if not has_template(event_slug, config):
+		return form_error("Certificate template not found on server.", 500)
+
+	fields = normalize_fields(config)
+	inputs = {}
+	for field in fields:
+		if field["source"] == "input":
+			posted = request.form.get("field_" + field["id"])
+			inputs[field["id"]] = (posted or "").strip()
+	if primary_id and not inputs.get(primary_id):
+		inputs[primary_id] = cert_name
+	values, resolve_error = resolve_field_values(fields, matched_rows, inputs)
+	if resolve_error:
+		return form_error(resolve_error)
+
+	# The club is signed into the token, so the club can never be spoofed by the
+	# URL at render time - the token minted here resolves to this club and no other.
+	token = make_cert_token(event_slug, values, club_slug=club_slug)
+	return redirect(url_for("preview_page", token=token))
+
+
+@app.route("/c/<club_slug>", methods=["GET"])
+def club_public(club_slug: str):
+	# A club's public page is dark unless approved. 404 - never 403 - so a probe
+	# cannot tell an unapproved club from one that does not exist.
+	if not _safe_club_slug(club_slug):
+		abort(404)
+	club = repo().get_club_by_slug(club_slug)
+	if club is None:
+		# csi-aseb has no club row until Phase 5: list its active legacy events.
+		if club_slug == LEGACY_TOKEN_CLUB:
+			legacy = [{"name": e.get("name", e.get("slug", "")), "slug": e.get("slug", "")}
+					  for e in load_all_events(active_only=True)]
+			return render_template("club/public.html",
+								   club={"name": LEGACY_TOKEN_CLUB, "slug": LEGACY_TOKEN_CLUB},
+								   events=legacy, club_slug=club_slug)
+		abort(404)
+	if club["status"] != "approved":
+		abort(404)
+	events = [e for e in repo().list_events(club["id"]) if e.get("active")]
+	return render_template("club/public.html", club=club, events=events, club_slug=club_slug)
+
+
+def _log_legacy_token(slug: str) -> None:
+	"""Record every club-less token resolution. When this goes quiet the grace
+	period is over and the legacy branch can be removed."""
+	log_event("legacy-token", f"resolved club-less certificate token for slug='{slug}'")
+
+
+# Club-event resolution is on the hot render path: _certificate_from_token calls
+# it for every preview and download. Without a cache, each call is two Postgres
+# round-trips (get_club_by_slug + get_event), so a 1000-participant spike would be
+# thousands of pooler queries for a workload the render cache serves from memory.
+# Cached per (club, event) with the same short TTL as the legacy config cache, and
+# invalidated on any club-event mutation so publish/unpublish reflect immediately.
+_PUBLIC_EVENT_CACHE: dict[tuple[str, str], tuple[dict, str | None, float]] = {}
+_PUBLIC_EVENT_CACHE_TTL_SEC = 30.0
+
+
+def _invalidate_public_event(club_slug: str, event_slug: str) -> None:
+	_PUBLIC_EVENT_CACHE.pop((club_slug, event_slug), None)
+
+
+def _invalidate_club_public_events(club_slug: str) -> None:
+	"""Drop every cached public event for a club (e.g. on suspend/approve)."""
+	for key in [k for k in _PUBLIC_EVENT_CACHE if k[0] == club_slug]:
+		_PUBLIC_EVENT_CACHE.pop(key, None)
+
+
+def _resolve_public_event_source(club_slug: str, event_slug: str) -> tuple[dict, str | None] | None:
+	"""The (config, storage_club) for a public event, ignoring the active flag.
+
+	The real-club Postgres path is cached; the csi-aseb bridge path is not, because
+	load_event already caches it. Returns the SHARED cached dict - the caller must
+	copy before handing it out or applying per-request state.
+	"""
+	key = (club_slug, event_slug)
+	cached = _PUBLIC_EVENT_CACHE.get(key)
+	if cached is not None and (time.time() - cached[2]) < _PUBLIC_EVENT_CACHE_TTL_SEC:
+		return cached[0], cached[1]
+
+	# The csi-aseb bridge: there is no club row for csi-aseb until Phase 5, so its
+	# events resolve from the legacy KV/file store. A database outage must not take
+	# this legacy serving down, so it degrades rather than 503-ing.
+	try:
+		club = repo().get_club_by_slug(club_slug)
+	except db.DatabaseUnavailable:
+		if club_slug == LEGACY_TOKEN_CLUB:
+			club = None
+		else:
+			raise
+
+	if club is None:
+		if club_slug != LEGACY_TOKEN_CLUB:
+			return None
+		config = load_event(event_slug)  # already cached via _EVENT_CONFIG_CACHE
+		if config is None:
+			return None
+		return config, None
+
+	if club["status"] != "approved":
+		return None
+	event = repo().get_event(club["id"], event_slug)
+	if event is None:
+		return None
+	config = dict(event.get("config") or {})
+	config["slug"] = event_slug
+	config.setdefault("name", event.get("name", ""))
+	config["active"] = bool(event.get("active"))
+	_PUBLIC_EVENT_CACHE[key] = (config, club["slug"], time.time())
+	if len(_PUBLIC_EVENT_CACHE) > 500:
+		_PUBLIC_EVENT_CACHE.clear()
+		_PUBLIC_EVENT_CACHE[key] = (config, club["slug"], time.time())
+	return config, club["slug"]
+
+
+def resolve_public_event(club_slug: str, event_slug: str,
+						 require_active: bool = True) -> tuple[dict, str | None] | None:
+	"""Resolve a public event to (config, storage_club_slug), or None (-> 404).
+
+	`storage_club_slug` is the object-store prefix: the club's slug for a real club
+	event, or None for a legacy csi-aseb event that still lives at the bare path
+	(until Phase 5). Isolation is by (club_id, slug), never slug alone, so club B
+	asking for club A's event slug simply gets None -> 404, never 403.
+	"""
+	if not _safe_club_slug(club_slug) or not safe_slug(event_slug):
+		return None
+	resolved = _resolve_public_event_source(club_slug, event_slug)
+	if resolved is None:
+		return None
+	config, storage_club = resolved
+	if require_active and not config.get("active", False):
+		return None
+	# Copy: the source may be the shared cache entry, and callers mutate what they get.
+	return copy.deepcopy(config), storage_club
+
+
+def _certificate_from_token(token: str) -> tuple[str, dict, dict, str | None] | None:
+	"""Resolve a certificate link to (slug, values, config, storage_club_slug).
+
+	The club comes from the SIGNED token, never from the URL. A club-less legacy
+	token resolves to csi-aseb only while the grace period is on, and every such
+	resolution is logged. A deactivated event's already-issued link still renders
+	(links are stateless and survive deactivation), but a token for an unapproved
+	or vanished club resolves to nothing.
+	"""
 	resolved = resolve_cert_token(token)
 	if resolved is None:
 		return None
-	slug, cert_name = resolved
-	config = load_event(slug)
-	if config is None:
+	club_slug, slug, values = resolved
+	if club_slug is None:
+		if not LEGACY_TOKEN_GRACE:
+			return None
+		_log_legacy_token(slug)
+		club_slug = LEGACY_TOKEN_CLUB
+	resolved_event = resolve_public_event(club_slug, slug, require_active=False)
+	if resolved_event is None:
 		return None
-	return slug, cert_name, config
+	config, storage_club = resolved_event
+	return slug, values, config, storage_club
 
 
 @app.route("/preview/<token>", methods=["GET"])
@@ -1672,8 +2841,23 @@ def preview_page(token: str):
 	resolved = _certificate_from_token(token)
 	if resolved is None:
 		return redirect(url_for("home"))
-	_, cert_name, config = resolved
-	return render_template("preview.html", cert_token=token, cert_name=cert_name, event=config)
+	_, values, config, _club = resolved
+	return render_template("preview.html", cert_token=token,
+						   cert_name=display_name(values), event=config)
+
+
+def render_busy_response():
+	"""
+	503 with Retry-After, for a render that could not get a slot.
+
+	Shedding load explicitly beats holding the connection until gunicorn's
+	--timeout kills the worker, which would drop every other request it was
+	serving too.
+	"""
+	response = make_response("Certificate rendering is busy. Please retry in a moment.", 503)
+	response.headers["Retry-After"] = "5"
+	response.cache_control.no_store = True
+	return response
 
 
 @app.route("/preview-image/<token>", methods=["GET"])
@@ -1681,8 +2865,11 @@ def preview_image(token: str):
 	resolved = _certificate_from_token(token)
 	if resolved is None:
 		return ("Not found", 404)
-	slug, cert_name, config = resolved
-	rendered = render_certificate(slug, cert_name, config, variant="preview")
+	slug, values, config, storage_club = resolved
+	try:
+		rendered = render_certificate(slug, values, config, variant="preview", club_slug=storage_club)
+	except RenderCapacityError:
+		return render_busy_response()
 	if rendered is None:
 		return ("Not found", 404)
 	image_bytes, etag, mimetype = rendered
@@ -1701,8 +2888,11 @@ def download_file(token: str):
 	resolved = _certificate_from_token(token)
 	if resolved is None:
 		return ("Not found", 404)
-	slug, cert_name, config = resolved
-	rendered = render_certificate(slug, cert_name, config, variant="download")
+	slug, values, config, storage_club = resolved
+	try:
+		rendered = render_certificate(slug, values, config, variant="download", club_slug=storage_club)
+	except RenderCapacityError:
+		return render_busy_response()
 	if rendered is None:
 		return ("Not found", 404)
 	image_bytes, _, mimetype = rendered
@@ -1711,7 +2901,7 @@ def download_file(token: str):
 		BytesIO(image_bytes),
 		mimetype=mimetype,
 		as_attachment=True,
-		download_name=safe_download_name(cert_name, slug),
+		download_name=safe_download_name(display_name(values), slug, mimetype),
 	)
 
 
@@ -1728,9 +2918,10 @@ def admin_login():
 			# New token for the newly privileged session, so a token an attacker
 			# may have observed pre-login cannot be replayed against admin routes.
 			session.clear()
+			session.permanent = True
 			session["admin_logged_in"] = True
 			csrf_token()
-			return redirect(url_for("admin_dashboard"))
+			return redirect(url_for("admin_clubs"))
 		else:
 			error = "Incorrect password."
 	return render_template("admin/login.html", error=error)
@@ -1742,10 +2933,424 @@ def admin_logout():
 	return redirect(url_for("admin_login"))
 
 
-@app.route("/admin", methods=["GET"])
+# The legacy single-tenant event manager. Kept at an obscure path for testing and
+# for the migrated csi-aseb events; the superadmin home is the clubs dashboard now.
+@app.route("/admin/legacy-events", methods=["GET"])
 @require_admin
 def admin_dashboard():
 	return render_template("admin/dashboard.html", events=load_all_events())
+
+
+# ─── Club auth & dashboard ────────────────────────────────────────────────────
+#
+# Self-registration creates a pending club. A pending club can log in and reach
+# its dashboard to configure; its public pages stay dark (404) until a superadmin
+# approves it. Passwords are stored only as werkzeug hashes.
+
+CLUB_PASSWORD_MIN = 8
+
+
+def _safe_club_slug(slug: str) -> bool:
+	return bool(_SLUG_RE.match(slug)) and ".." not in slug and 3 <= len(slug) <= 40
+
+
+@app.route("/register", methods=["GET", "POST"])
+def club_register():
+	if request.method == "GET":
+		return render_template("auth/register.html", error=None, form={})
+	name = (request.form.get("name", "") or "").strip()
+	slug = (request.form.get("slug", "") or "").strip().lower()
+	password = request.form.get("password", "")
+	form = {"name": name, "slug": slug}
+
+	def fail(message):
+		return render_template("auth/register.html", error=message, form=form), 400
+
+	if not name or not slug or not password:
+		return fail("Club name, address, and password are all required.")
+	if not _safe_club_slug(slug):
+		return fail("Address must be 3-40 characters, lowercase letters, numbers, and hyphens.")
+	if len(password) < CLUB_PASSWORD_MIN:
+		return fail(f"Password must be at least {CLUB_PASSWORD_MIN} characters.")
+	if repo().get_club_by_slug(slug) is not None:
+		return fail("That address is already taken. Choose another.")
+
+	try:
+		club = repo().create_club(slug, name, generate_password_hash(password))
+	except ValueError:
+		return fail("That address is already taken. Choose another.")
+
+	# A fresh session for the newly created club, so a pre-registration token
+	# cannot be replayed against the dashboard.
+	session.clear()
+	session.permanent = True
+	session["club_id"] = club["id"]
+	csrf_token()
+	return redirect(url_for("club_dashboard"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def club_login():
+	if request.method == "GET":
+		return render_template("auth/login.html", error=None)
+	slug = (request.form.get("slug", "") or "").strip().lower()
+	password = request.form.get("password", "")
+	club = repo().get_club_by_slug(slug) if slug else None
+	# One generic message whether the club is unknown or the password is wrong,
+	# and check_password_hash always runs on a real-looking hash so timing does
+	# not distinguish "no such club" from "bad password".
+	reference = club["password_hash"] if club else generate_password_hash("_")
+	# Computed once: the KDF is deliberately slow, so run it a single time and then
+	# branch on status. Still runs on a real-looking hash when the club is unknown,
+	# so timing does not distinguish "no such club" from "bad password".
+	credentials_ok = club is not None and check_password_hash(reference, password)
+	if credentials_ok and club["status"] != "suspended":
+		session.clear()
+		session.permanent = True
+		session["club_id"] = club["id"]
+		csrf_token()
+		return redirect(url_for("club_dashboard"))
+	if credentials_ok and club["status"] == "suspended":
+		return render_template("auth/login.html",
+							   error="This club has been suspended. Contact the administrator."), 403
+	return render_template("auth/login.html", error="Incorrect club address or password."), 400
+
+
+@app.route("/logout", methods=["POST"])
+def club_logout():
+	session.pop("club_id", None)
+	return redirect(url_for("club_login"))
+
+
+@app.route("/clubs/autocomplete", methods=["GET"])
+def club_autocomplete():
+	# Returns nothing under three characters, so the full club list is never
+	# handed out on page load.
+	prefix = (request.args.get("q", "") or "").strip().lower()
+	if len(prefix) < 3:
+		return jsonify({"slugs": []})
+	return jsonify({"slugs": repo().search_club_slugs(prefix)})
+
+
+@app.route("/dashboard", methods=["GET"])
+@require_club
+def club_dashboard():
+	club = g.club
+	events = repo().list_events(club["id"])
+	used = club_storage_bytes(club["slug"])
+	quota = int(club["quota_bytes"])
+	return render_template("club/dashboard.html", club=club, events=events,
+						   pending=(club["status"] == "pending"),
+						   active_count=sum(1 for e in events if e.get("active")),
+						   used_mb=used // (1024 * 1024), quota_mb=quota // (1024 * 1024),
+						   used_pct=min(100, round(used * 100 / quota)) if quota else 0)
+
+
+def _event_detail(club, slug, error=None, success=None, status=200):
+	event = repo().get_event(club["id"], slug)
+	if event is None:
+		abort(404)
+	config = event.get("config") or {}
+	used = club_storage_bytes(club["slug"])
+	return render_template(
+		"club/event_detail.html", club=club, event=event,
+		has_template=bool(config.get("template_version")),
+		used_mb=used // (1024 * 1024), quota_mb=int(club["quota_bytes"]) // (1024 * 1024),
+		error=error, success=success), status
+
+
+@app.route("/dashboard/events", methods=["POST"])
+@require_club
+def club_create_event():
+	club = g.club
+	name = (request.form.get("name", "") or "").strip()
+	slug = (request.form.get("slug", "") or "").strip().lower()
+	events = repo().list_events(club["id"])
+	if not name or not slug or not safe_slug(slug):
+		return render_template("club/dashboard.html", club=club, events=events,
+							   pending=(club["status"] == "pending"),
+							   error="Give the event a name and a valid address (lowercase letters, numbers, hyphens)."), 400
+	try:
+		created = repo().create_event(club["id"], slug, name, {})
+	except ValueError:
+		return render_template("club/dashboard.html", club=club, events=events,
+							   pending=(club["status"] == "pending"),
+							   error=f"You already have an event at '{slug}'."), 400
+	if created is None:
+		abort(404)
+	return redirect(url_for("club_event_detail", slug=slug))
+
+
+@app.route("/dashboard/events/<slug>", methods=["GET"])
+@require_club
+def club_event_detail(slug: str):
+	if not safe_slug(slug):
+		abort(404)
+	return _event_detail(g.club, slug)
+
+
+@app.route("/dashboard/events/<slug>/template", methods=["POST"])
+@require_club
+def club_upload_template(slug: str):
+	club = g.club
+	if not safe_slug(slug):
+		abort(404)
+	event = repo().get_event(club["id"], slug)
+	if event is None:
+		abort(404)
+
+	file = request.files.get("template_file")
+	if not file or file.filename == "":
+		return _event_detail(club, slug, error="No file selected.", status=400)
+	ext = os.path.splitext(secure_filename(file.filename).lower())[1].lower()
+	if ext not in TEMPLATE_EXTENSIONS:
+		return _event_detail(club, slug, error="Template must be PNG, JPG, GIF, or WebP.", status=400)
+
+	file.stream.seek(0)
+	data = file.stream.read()
+	# Magic-byte and decompression-bomb validation - the extension is never trusted.
+	validation_error = validate_template_upload(data, ext)
+	if validation_error:
+		return _event_detail(club, slug, error=validation_error, status=400)
+
+	# Quota is checked before anything is written, and a rejection stores nothing.
+	# A replacement upserts over the existing template, so net that object out.
+	old_ext = (event.get("config") or {}).get("template_ext")
+	replacing = _template_object_path(slug, old_ext, club["slug"]) if old_ext else None
+	ok, message = quota_status(club, len(data), replacing_path=replacing)
+	if not ok:
+		return _event_detail(club, slug, error=message, status=400)
+
+	try:
+		version = save_template_bytes(slug, data, ext, club_slug=club["slug"])
+	except Exception:
+		return _event_detail(club, slug, error="Could not save the template to storage. Try again.", status=502)
+
+	config = dict(event.get("config") or {})
+	config["template_ext"] = ext
+	config["template_version"] = version
+	repo().update_event(club["id"], slug, config=config, template_ext=ext, template_version=version)
+	_invalidate_public_event(club["slug"], slug)
+	warm_template_cache_from_bytes(slug, version, data, club_slug=club["slug"])
+	return _event_detail(club, slug, success="Template uploaded.")
+
+
+@app.route("/dashboard/events/<slug>/csv", methods=["POST"])
+@require_club
+def club_upload_csv(slug: str):
+	club = g.club
+	if not safe_slug(slug):
+		abort(404)
+	event = repo().get_event(club["id"], slug)
+	if event is None:
+		abort(404)
+
+	file = request.files.get("csv_file")
+	if not file or file.filename == "":
+		return _event_detail(club, slug, error="No file selected.", status=400)
+	ext = os.path.splitext(secure_filename(file.filename).lower())[1]
+	if ext not in PARTICIPANT_EXTENSIONS:
+		return _event_detail(club, slug, error="Participants file must be a .csv or .xlsx.", status=400)
+
+	raw_upload = file.stream.read()
+	content, upload_error = participant_text_from_upload(raw_upload, ext)
+	if upload_error:
+		return _event_detail(club, slug, error=upload_error, status=400)
+
+	# A re-upload replaces the same data.csv, so net the existing object out.
+	replacing = _participants_object_path(slug, "data.csv", club_slug=club["slug"])
+	ok, message = quota_status(club, len(content.encode("utf-8")), replacing_path=replacing)
+	if not ok:
+		return _event_detail(club, slug, error=message, status=400)
+
+	source = (raw_upload, ext) if ext != ".csv" else (content.encode("utf-8"), ".csv")
+	try:
+		save_event_csv(slug, content, source=source, club_slug=club["slug"])
+	except Exception:
+		return _event_detail(club, slug, error="Could not save the participant list. Try again.", status=502)
+	_invalidate_public_event(club["slug"], slug)
+	return _event_detail(club, slug, success="Participant list uploaded.")
+
+
+def _club_event_or_404(club, slug):
+	if not safe_slug(slug):
+		abort(404)
+	event = repo().get_event(club["id"], slug)
+	if event is None:
+		abort(404)
+	return event
+
+
+@app.route("/dashboard/events/<slug>/config", methods=["POST"])
+@require_club
+def club_update_config(slug):
+	club = g.club
+	event = _club_event_or_404(club, slug)
+	config = dict(event.get("config") or {})
+	name = (request.form.get("name", "") or event.get("name") or "").strip()
+	validation_type = request.form.get("validation_type", config.get("validation_type", "player_team"))
+	if validation_type not in VALIDATION_TYPES:
+		validation_type = "player_team"
+	config["validation_type"] = validation_type
+	# Only the "custom" type carries custom fields, and only then does the settings
+	# form submit them. For every other type, leave any existing custom config
+	# untouched rather than wiping it (the form has no field to resubmit it).
+	if validation_type == "custom":
+		parsed = parse_custom_fields(request.form.getlist("custom_fields"))
+		config["custom_fields"] = parsed
+		existing_drop = config.get("custom_dropdown_fields") or []
+		config["custom_dropdown_fields"] = [f for f in existing_drop if f in parsed]
+	config["download_format"] = normalize_download_format(
+		request.form.get("download_format"), config.get("download_format", DEFAULT_DOWNLOAD_FORMAT))
+	repo().update_event(club["id"], slug, name=name, config=config)
+	_invalidate_public_event(club["slug"], slug)
+	return _event_detail(club, slug, success="Settings saved.")
+
+
+@app.route("/dashboard/events/<slug>/toggle", methods=["POST"])
+@require_club
+def club_toggle_event(slug):
+	club = g.club
+	event = _club_event_or_404(club, slug)
+	# Publishing needs a template, or the public page would 500 on the first visit.
+	going_active = not bool(event.get("active"))
+	if going_active and not (event.get("config") or {}).get("template_version"):
+		return _event_detail(club, slug, error="Upload a template before publishing this event.", status=400)
+	repo().update_event(club["id"], slug, active=going_active)
+	_invalidate_public_event(club["slug"], slug)
+	if request.form.get("next") == "dashboard":
+		return redirect(url_for("club_dashboard"))
+	return redirect(url_for("club_event_detail", slug=slug))
+
+
+@app.route("/dashboard/events/<slug>/delete", methods=["POST"])
+@require_club
+def club_delete_event(slug):
+	club = g.club
+	event = _club_event_or_404(club, slug)
+	# Typed-confirmation, matching the superadmin delete: the slug must be retyped.
+	if request.form.get("confirm", "") != slug:
+		return _event_detail(club, slug, error="Type the event address to confirm deletion.", status=400)
+	delete_event_storage(slug, club_slug=club["slug"])
+	repo().delete_event(club["id"], slug)
+	_invalidate_public_event(club["slug"], slug)
+	return redirect(url_for("club_dashboard"))
+
+
+@app.route("/dashboard/events/<slug>/template-preview", methods=["GET"])
+@require_club
+def club_template_preview(slug):
+	club = g.club
+	event = _club_event_or_404(club, slug)
+	config = event.get("config") or {}
+	data = load_template_bytes(slug, config, club["slug"])
+	if data is None:
+		return "Template not found", 404
+	ext = template_ext_for(slug, config)
+	response = send_file(BytesIO(data),
+						 mimetype=TEMPLATE_CONTENT_TYPES.get(ext, "application/octet-stream"),
+						 etag=(config.get("template_version") or "none"))
+	response.cache_control.private = True
+	response.cache_control.max_age = 60
+	return response
+
+
+@app.route("/dashboard/events/<slug>/coordinates", methods=["GET"])
+@require_club
+def club_coordinate_editor(slug):
+	club = g.club
+	event = _club_event_or_404(club, slug)
+	config = event.get("config") or {}
+	config.setdefault("slug", slug)
+	config.setdefault("name", event.get("name", slug))
+	dataset = load_participant_dataset(slug, club["slug"])
+	sample_rows = dataset.raw_rows[:25]
+	fonts = [
+		{"key": o["key"], "label": o["label"], "family": o["css_family"],
+		 "weight": o["css_weight"], "url": url_for("font_asset", font_key=o["key"])}
+		for o in available_font_options()
+	]
+	return render_template(
+		"admin/coordinate_editor.html",
+		event=config,
+		fields_json=_json_for_script(normalize_fields(config)),
+		columns_json=_json_for_script(dataset.columns),
+		sample_rows_json=_json_for_script(sample_rows),
+		fonts_json=_json_for_script(fonts),
+		max_fields=MAX_FIELDS,
+		has_csv=bool(dataset.raw_rows),
+		save_url=url_for("club_save_fields", slug=slug),
+		template_url=url_for("club_template_preview", slug=slug),
+		back_url=url_for("club_event_detail", slug=slug),
+	)
+
+
+@app.route("/dashboard/events/<slug>/fields", methods=["POST"])
+@require_club
+def club_save_fields(slug):
+	club = g.club
+	if not safe_slug(slug):
+		return jsonify({"ok": False, "error": "Unknown event."}), 404
+	event = repo().get_event(club["id"], slug)
+	if event is None:
+		return jsonify({"ok": False, "error": "Unknown event."}), 404
+	payload = request.get_json(silent=True) or {}
+	fields, error = validate_fields_payload(slug, payload.get("fields"), club_slug=club["slug"])
+	if error:
+		return jsonify({"ok": False, "error": error}), 400
+	config = dict(event.get("config") or {})
+	config["fields"] = fields
+	repo().update_event(club["id"], slug, config=config)
+	return jsonify({"ok": True, "message": "Placement saved.", "fields": fields})
+
+	return _event_detail(club, slug, success="Participant list uploaded.")
+
+
+
+
+# ─── Superadmin: club approvals ───────────────────────────────────────────────
+
+# The superadmin home: manage clubs. Also answers /admin/clubs so old links survive.
+@app.route("/admin", methods=["GET"])
+@app.route("/admin/clubs", methods=["GET"])
+@require_superadmin
+def admin_clubs():
+	return render_template("admin/clubs.html", clubs=repo().list_clubs())
+
+
+@app.route("/admin/clubs/<club_id>/status", methods=["POST"])
+@require_superadmin
+def admin_set_club_status(club_id: str):
+	status = request.form.get("status", "")
+	if status not in db.CLUB_STATUSES:
+		return redirect(url_for("admin_clubs"))
+	repo().set_club_status(club_id, status)
+	# Suspending/approving flips a club's whole public surface, so drop its cached
+	# public-event entries - a suspended club must go dark promptly, not after the TTL.
+	club = repo().get_club_by_id(club_id)
+	if club:
+		_invalidate_club_public_events(club["slug"])
+	return redirect(url_for("admin_clubs"))
+
+
+@app.route("/admin/clubs/<club_id>/quota", methods=["POST"])
+@require_superadmin
+def admin_set_club_quota(club_id: str):
+	try:
+		quota_mb = max(1, int(request.form.get("quota_mb", "")))
+	except (TypeError, ValueError):
+		return redirect(url_for("admin_clubs"))
+	repo().set_club_quota(club_id, quota_mb * 1024 * 1024)
+	return redirect(url_for("admin_clubs"))
+
+
+@app.route("/admin/clubs/<club_id>/reset-password", methods=["POST"])
+@require_superadmin
+def admin_reset_club_password(club_id: str):
+	new_password = request.form.get("password", "")
+	if len(new_password) >= CLUB_PASSWORD_MIN:
+		repo().set_club_password(club_id, generate_password_hash(new_password))
+	return redirect(url_for("admin_clubs"))
 
 
 @app.route("/admin/events/new", methods=["GET"])
@@ -1769,10 +3374,14 @@ def admin_create_event():
 	font_size = _parse_int(request.form.get("font_size"), 100)
 	font_color = _parse_color(request.form.get("font_color", ""))
 	font_key = normalize_font_key(request.form.get("font_key"), DEFAULT_FONT_KEY)
+	# Written explicitly on every new event, so an absent key only ever describes a
+	# config that predates the format option and must keep rendering PNG.
+	download_format = normalize_download_format(request.form.get("download_format"),
+											   NEW_EVENT_DOWNLOAD_FORMAT)
 	form_data = {"name": name, "slug": slug, "validation_type": validation_type, "custom_fields": custom_fields,
 				 "custom_dropdown_fields": custom_dropdown_fields,
 				 "text_x": text_x, "text_y": text_y, "font_size": font_size, "font_color": font_color,
-				 "font_key": font_key}
+				 "font_key": font_key, "download_format": download_format}
 	if not name or not slug:
 		return render_template("admin/event_form.html", event=form_data, is_new=True, error="Name and slug are required."), 400
 	if not safe_slug(slug):
@@ -1784,7 +3393,8 @@ def admin_create_event():
 	os.makedirs(_event_dir(slug), exist_ok=True)
 	config = {"name": name, "slug": slug, "active": False, "validation_type": validation_type, "custom_fields": custom_fields,
 			  "custom_dropdown_fields": custom_dropdown_fields,
-			  "text_x": text_x, "text_y": text_y, "font_size": font_size, "font_color": font_color, "font_key": font_key}
+			  "text_x": text_x, "text_y": text_y, "font_size": font_size, "font_color": font_color, "font_key": font_key,
+			  "download_format": download_format}
 	save_event_config(slug, config)
 	_set_event_state(slug, deleted=False, active=False)
 	return redirect(url_for("admin_edit_event", slug=slug))
@@ -1830,6 +3440,11 @@ def admin_update_config(slug: str):
 	config["font_size"] = _parse_int(request.form.get("font_size"), config.get("font_size", 100))
 	config["font_color"] = _parse_color(request.form.get("font_color"), config.get("font_color", [50, 34, 24]))
 	config["font_key"] = normalize_font_key(request.form.get("font_key"), config.get("font_key", DEFAULT_FONT_KEY))
+	# A legacy config with no key falls back to PNG and gets it written down, which
+	# preserves its current output while making the choice visible from then on.
+	config["download_format"] = normalize_download_format(
+		request.form.get("download_format"),
+		config.get("download_format", DEFAULT_DOWNLOAD_FORMAT))
 	save_event_config(slug, config)
 	if request.headers.get("X-Requested-With") == "XMLHttpRequest":
 		return jsonify({"ok": True, "message": "Settings saved."})
@@ -1883,6 +3498,7 @@ def admin_upload_template(slug: str):
 	config["template_ext"] = ext
 	config["template_version"] = version
 	save_event_config(slug, config)
+	warm_template_cache_from_bytes(slug, version, data)
 	return render_template("admin/event_form.html", event=config, is_new=False,
 				success="Template uploaded successfully.", error=None, has_template=True, has_csv=has_csv,
 				csv_columns=csv_headers(slug))
@@ -2072,13 +3688,53 @@ def admin_delete_event(slug: str):
 @app.route("/admin/events/<slug>/coordinates", methods=["GET"])
 @require_admin
 def admin_coordinate_editor(slug: str):
-	"""Full-screen coordinate editor for certificate text positioning."""
+	"""Full-screen field placement editor. Draws and saves the event's fields list."""
 	if not safe_slug(slug):
 		return redirect(url_for("admin_dashboard"))
 	config = load_event(slug)
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
-	return render_template("admin/coordinate_editor.html", event=config)
+	dataset = load_participant_dataset(slug)
+	# A handful of real rows drive the editor's live preview and the sample-picker,
+	# so a club sees its actual data laid out rather than lorem. Admin-only, and the
+	# admin can already see the whole CSV, so this leaks nothing new.
+	sample_rows = dataset.raw_rows[:25]
+	fonts = [
+		{"key": o["key"], "label": o["label"], "family": o["css_family"],
+		 "weight": o["css_weight"], "url": url_for("font_asset", font_key=o["key"])}
+		for o in available_font_options()
+	]
+	return render_template(
+		"admin/coordinate_editor.html",
+		event=config,
+		fields_json=_json_for_script(normalize_fields(config)),
+		columns_json=_json_for_script(dataset.columns),
+		sample_rows_json=_json_for_script(sample_rows),
+		fonts_json=_json_for_script(fonts),
+		max_fields=MAX_FIELDS,
+		has_csv=_event_csv_exists(slug),
+		save_url=url_for("admin_save_fields", slug=slug),
+		template_url=url_for("admin_template_preview", slug=slug),
+		back_url=url_for("admin_edit_event", slug=slug),
+	)
+
+
+@app.route("/admin/events/<slug>/fields", methods=["POST"])
+@require_admin
+def admin_save_fields(slug: str):
+	"""Persist the editor's field list. JSON in, JSON out, CSRF via header."""
+	if not safe_slug(slug):
+		return jsonify({"ok": False, "error": "Unknown event."}), 404
+	config = load_event(slug)
+	if config is None:
+		return jsonify({"ok": False, "error": "Unknown event."}), 404
+	payload = request.get_json(silent=True) or {}
+	fields, error = validate_fields_payload(slug, payload.get("fields"))
+	if error:
+		return jsonify({"ok": False, "error": error}), 400
+	config["fields"] = fields
+	save_event_config(slug, config)
+	return jsonify({"ok": True, "message": "Placement saved.", "fields": fields})
 
 
 @app.route("/admin/events/<slug>/template-preview", methods=["GET"])
@@ -2113,12 +3769,18 @@ def admin_render_preview(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return "Not found", 404
-	image = get_template_image(slug, config)
-	if image is None:
-		return "Template not found", 404
-	metadata = build_preview_metadata(config, request.args.get("cert_name"))
-	draw_name_on_image(image, metadata)
-	image_bytes, mimetype = encode_certificate(image, variant="preview")
+	try:
+		with render_slot(slug):
+			image = get_template_image(slug, config)
+			if image is None:
+				return "Template not found", 404
+			metadata = build_preview_metadata(config, request.args.get("cert_name"))
+			draw_name_on_image(image, metadata)
+			image_bytes, mimetype = encode_certificate(image, variant="preview")
+	except RenderCapacityError:
+		# Admin previews are the same CPU as participant renders, so they queue in
+		# the same pool rather than competing with it from outside.
+		return render_busy_response()
 	response = send_file(BytesIO(image_bytes), mimetype=mimetype)
 	# Short cache for admin previews (they may change as settings are edited)
 	response.cache_control.max_age = 60

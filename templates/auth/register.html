@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Register a club &mdash; Certificate Portal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="auth">
+      <section class="auth__card">
+        <div class="auth__brand">
+          <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="5"/><path d="M9 13.5 8 21l4-2 4 2-1-7.5"/></svg></span>
+          Certificate Portal
+        </div>
+        <h1>Register your club</h1>
+        <p class="lede">Create an account. An administrator approves it before your public page goes live.</p>
+
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+        <form action="{{ url_for('club_register') }}" method="post" class="form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <label class="field-label" for="name">Club name</label>
+          <input id="name" name="name" type="text" value="{{ form.name or '' }}"
+                 placeholder="CSI ASEB" autocomplete="organization" required />
+
+          <label class="field-label" for="slug" style="margin-top:var(--space-3)">Address</label>
+          <input id="slug" name="slug" type="text" value="{{ form.slug or '' }}"
+                 placeholder="csi-aseb" autocomplete="off" pattern="[a-z0-9][a-z0-9-]*"
+                 minlength="3" maxlength="40" required />
+          <p class="panel__hint" style="margin:.4rem 0 0">Your public link will be <code class="addr">/c/&lt;address&gt;</code>. Lowercase letters, numbers, hyphens.</p>
+
+          <label class="field-label" for="password" style="margin-top:var(--space-3)">Password</label>
+          <input id="password" name="password" type="password"
+                 placeholder="At least 8 characters" autocomplete="new-password" minlength="8" required />
+
+          <button type="submit" style="margin-top:var(--space-4)">Create club</button>
+        </form>
+
+        <p class="alt">Already registered? <a href="{{ url_for('club_login') }}">Sign in</a></p>
+      </section>
+    </main>
+  </body>
+</html>

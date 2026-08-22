@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>{{ event.name }} &mdash; {{ club.name }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <header class="appbar">
+      <a href="{{ url_for('club_dashboard') }}" class="appbar__brand">
+        <span class="mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="9" r="5" /><path d="M9 13.5 8 21l4-2 4 2-1-7.5" /></svg>
+        </span>
+        Certificate Portal
+      </a>
+      <div class="appbar__spacer"></div>
+      <a href="{{ url_for('club_dashboard') }}" class="appbar__link">&larr; Dashboard</a>
+    </header>
+
+    <main class="wrap wrap--wide">
+      <div class="page-head">
+        <div class="page-head__text">
+          <h1>{{ event.name }}</h1>
+          <p class="sub addr-copy">
+            <a class="evlink" href="{{ url_for('club_event_page', club_slug=club.slug, event_slug=event.slug) }}"
+               target="_blank" rel="noopener">/c/{{ club.slug }}/{{ event.slug }}</a>
+            <button type="button" class="copybtn"
+                    data-copy="{{ url_for('club_event_page', club_slug=club.slug, event_slug=event.slug) }}">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              <span class="copybtn__label">Copy</span>
+            </button>
+            {% if event.active %}
+            <span class="pill pill--live" style="margin-left:.4rem"><span class="dot"></span>Live</span>
+            {% else %}
+            <span class="pill pill--draft" style="margin-left:.4rem">Draft</span>
+            {% endif %}
+          </p>
+        </div>
+        {% if event.active %}
+        <div class="page-head__actions">
+          <a href="{{ url_for('club_public', club_slug=club.slug) }}" class="button-link secondary" target="_blank" rel="noopener">View public page</a>
+        </div>
+        {% endif %}
+      </div>
+
+      {% if error %}
+      <div class="banner banner--warn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 8v4M12 16h.01"/><circle cx="12" cy="12" r="9"/></svg>
+        <span>{{ error }}</span>
+      </div>
+      {% endif %}
+      {% if success %}
+      <div class="banner banner--ok">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m5 13 4 4L19 7"/></svg>
+        <span>{{ success }}</span>
+      </div>
+      {% endif %}
+
+      <div class="grid-2">
+        <!-- Template -->
+        <div class="panel">
+          <div class="panel__head">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></svg></span>
+            <h2>Template</h2>
+            {% if has_template %}<span class="pill pill--live" style="margin-left:auto"><span class="dot"></span>Uploaded</span>
+            {% else %}<span class="pill pill--pending" style="margin-left:auto">Required</span>{% endif %}
+          </div>
+          <p class="panel__hint">The certificate background. PNG, JPG, GIF, or WebP, up to 10&nbsp;MB.</p>
+          <form action="{{ url_for('club_upload_template', slug=event.slug) }}" method="post"
+                enctype="multipart/form-data" class="form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <input type="file" name="template_file" accept="image/png,image/jpeg,image/gif,image/webp" required />
+            <button type="submit">{{ 'Replace template' if has_template else 'Upload template' }}</button>
+          </form>
+        </div>
+
+        <!-- Participants -->
+        <div class="panel">
+          <div class="panel__head">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M16 21v-2a4 4 0 0 0-8 0v2"/><circle cx="12" cy="7" r="4"/></svg></span>
+            <h2>Participants</h2>
+          </div>
+          <p class="panel__hint">A .csv or .xlsx of the people who may claim a certificate.</p>
+          <form action="{{ url_for('club_upload_csv', slug=event.slug) }}" method="post"
+                enctype="multipart/form-data" class="form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <input type="file" name="csv_file" accept=".csv,.xlsx" required />
+            <button type="submit">Upload participants</button>
+          </form>
+        </div>
+
+        <!-- Placement -->
+        <div class="panel">
+          <div class="panel__head">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="9" cy="8" r="2" fill="currentColor"/><circle cx="15" cy="16" r="2" fill="currentColor"/></svg></span>
+            <h2>Placement</h2>
+          </div>
+          <p class="panel__hint">Position the name and other fields on the certificate.</p>
+          <a href="{{ url_for('club_coordinate_editor', slug=event.slug) }}" class="button-link">Open placement editor</a>
+        </div>
+
+        <!-- Settings -->
+        <div class="panel">
+          <div class="panel__head">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+            <h2>Settings</h2>
+          </div>
+          <form action="{{ url_for('club_update_config', slug=event.slug) }}" method="post" class="form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <label class="field-label" for="name">Event name</label>
+            <input id="name" name="name" type="text" value="{{ event.name }}" required />
+
+            <label class="field-label" for="validation_type" style="margin-top:var(--space-3)">Who can claim a certificate</label>
+            <select id="validation_type" name="validation_type" class="coord-input">
+              {% for value, label in validation_type_labels.items() %}
+              <option value="{{ value }}"
+                {{ 'selected' if event.config and event.config.validation_type == value else '' }}>{{ label }}</option>
+              {% endfor %}
+            </select>
+            <p class="panel__hint" id="vtypeHint" style="margin:.45rem 0 0"></p>
+
+            <div id="customWrap" style="margin-top:var(--space-3); display:none">
+              <label class="field-label" for="custom_fields">Details participants must enter</label>
+              <input id="custom_fields" name="custom_fields" type="text" autocomplete="off"
+                     value="{{ (event.config.custom_fields or [])|join(', ') if event.config else '' }}"
+                     placeholder="email, roll no" />
+              <p class="panel__hint" style="margin:.45rem 0 0">Comma-separated column names from your
+                participants file. Participants type these on the claim page to find their row.</p>
+            </div>
+
+            <label class="field-label" for="download_format" style="margin-top:var(--space-3)">Download format</label>
+            <select id="download_format" name="download_format" class="coord-input">
+              <option value="jpeg" {{ 'selected' if not (event.config and event.config.download_format == 'png') else '' }}>JPEG &mdash; recommended</option>
+              <option value="png" {{ 'selected' if event.config and event.config.download_format == 'png' else '' }}>PNG &mdash; high quality</option>
+            </select>
+            <button type="submit" style="margin-top:var(--space-4)">Save settings</button>
+          </form>
+        </div>
+      </div>
+
+      <!-- Publish -->
+      <div class="panel">
+        <div class="panel__row">
+          <div>
+            <div class="panel__head" style="margin-bottom:.2rem">
+              <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/></svg></span>
+              <h2>Publish</h2>
+            </div>
+            <p class="panel__hint" style="margin:0">
+              {% if event.active %}Live on your public page.
+              {% else %}Draft &mdash; not visible publicly yet. A template is required to publish.{% endif %}</p>
+          </div>
+          <form action="{{ url_for('club_toggle_event', slug=event.slug) }}" method="post" style="margin:0">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            {% if event.active %}
+            <button type="submit" class="button-link secondary">Unpublish</button>
+            {% else %}
+            <button type="submit">Publish</button>
+            {% endif %}
+          </form>
+        </div>
+      </div>
+
+      <!-- Danger zone: folded away so the destructive form is never sitting open. -->
+      <details class="disclosure disclosure--danger" style="margin-top:var(--space-5)">
+        <summary>
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></span>
+          Delete event
+          <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m9 6 6 6-6 6"/></svg></span>
+        </summary>
+        <div class="disclosure__body">
+          <p class="panel__hint" style="margin-top:0">Permanently removes this event and all its files. This cannot be undone.</p>
+          <form action="{{ url_for('club_delete_event', slug=event.slug) }}" method="post" class="form"
+                onsubmit="return confirm('Delete {{ event.slug }} and all its files? This cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <label class="field-label" for="confirm">Type <code class="addr">{{ event.slug }}</code> to confirm</label>
+            <input id="confirm" name="confirm" type="text" autocomplete="off" placeholder="{{ event.slug }}" />
+            <button type="submit" class="btn-danger" style="margin-top:var(--space-3)">Delete this event</button>
+          </form>
+        </div>
+      </details>
+    </main>
+
+    <script>
+      document.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-copy]');
+        if (!btn) return;
+        e.preventDefault();
+        const url = location.origin + btn.getAttribute('data-copy');
+        const label = btn.querySelector('.copybtn__label');
+        const done = () => {
+          btn.classList.add('is-ok');
+          if (label) label.textContent = 'Copied';
+          setTimeout(() => { btn.classList.remove('is-ok'); if (label) label.textContent = 'Copy'; }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(url).then(done).catch(() => {});
+        }
+      });
+
+      // Explain each "who can claim" option, and reveal the custom-fields box only
+      // when Custom Fields is chosen, so the option is never a mystery.
+      (function () {
+        const sel = document.getElementById('validation_type');
+        if (!sel) return;
+        const hint = document.getElementById('vtypeHint');
+        const customWrap = document.getElementById('customWrap');
+        const DESC = {
+          player_team: 'Participants enter their name and team; matched against your participants file.',
+          name_only: 'Participants enter just their name; matched against your participants file.',
+          email: 'Participants enter their registration email to find their row.',
+          badge_id: 'Participants enter their roll number to find their row.',
+          custom: 'You choose which details participants must enter to find their row — list the column names below.',
+          none: 'Anyone can download. No matching against a participants file.'
+        };
+        function sync() {
+          if (hint) hint.textContent = DESC[sel.value] || '';
+          if (customWrap) customWrap.style.display = (sel.value === 'custom') ? '' : 'none';
+        }
+        sel.addEventListener('change', sync);
+        sync();
+      })();
+    </script>
+  </body>
+</html>

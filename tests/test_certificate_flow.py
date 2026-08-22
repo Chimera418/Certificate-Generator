@@ -43,7 +43,11 @@ try:
 
     # ── pages ────────────────────────────────────────────────────────────────
     r.check("GET / returns 200", client.get("/").status_code == 200)
-    r.check("event page renders", client.get(f"/events/{TEST_SLUG}").status_code == 200)
+    # /events/<slug> is now a 301 to the club-scoped URL; follow it to the form.
+    r.check("event page renders (via the club-scoped redirect)",
+            client.get(f"/events/{TEST_SLUG}", follow_redirects=True).status_code == 200)
+    r.check("the flat /events URL 301s to /c/csi-aseb/",
+            client.get(f"/events/{TEST_SLUG}").status_code == 301)
 
     health = client.get("/healthz")
     r.check("GET /healthz returns 200", health.status_code == 200)
@@ -58,7 +62,8 @@ try:
 
     # ── tokens ───────────────────────────────────────────────────────────────
     token = A.make_cert_token(TEST_SLUG, TEST_NAME)
-    r.check("token round trips", A.read_cert_token(token) == (TEST_SLUG, TEST_NAME))
+    # Tokens now carry a value map; a bare name is stored as the "name" field.
+    r.check("token round trips", A.read_cert_token(token) == (None, TEST_SLUG, {"name": TEST_NAME}))
     r.check("tampered token rejected", A.read_cert_token(token[:-2] + "xy") is None)
     r.check("garbage token rejected", A.read_cert_token("not-a-token") is None)
 
@@ -158,7 +163,9 @@ try:
     # ── admin surface still works ────────────────────────────────────────────
     r.check("admin requires login", A.app.test_client().get("/admin").status_code == 302)
     admin = admin_client()
-    r.check("admin dashboard renders", admin.get("/admin").status_code == 200)
+    # /admin is the clubs dashboard now; the legacy event manager moved to /admin/legacy-events.
+    r.check("clubs dashboard renders", admin.get("/admin").status_code == 200)
+    r.check("legacy events dashboard renders", admin.get("/admin/legacy-events").status_code == 200)
     r.check("admin event editor renders", admin.get(f"/admin/events/{TEST_SLUG}").status_code == 200)
     r.check("admin template preview serves",
             admin.get(f"/admin/events/{TEST_SLUG}/template-preview").status_code == 200)
@@ -168,7 +175,8 @@ try:
             render_preview.status_code)
     r.check("admin logs render", admin.get("/admin/logs").status_code == 200)
     r.check("dashboard names the real validation type",
-            b"Email" in admin.get("/admin").data and b"Name Only" not in admin.get("/admin").data,
+            b"Email" in admin.get("/admin/legacy-events").data
+            and b"Name Only" not in admin.get("/admin/legacy-events").data,
             "email event should not be labelled 'Name Only'")
     r.check("every validation type has a label",
             set(A.VALIDATION_TYPE_LABELS) == A.VALIDATION_TYPES,
@@ -178,7 +186,7 @@ try:
     A._EVENT_CSV_CACHE.clear()
     reads = []
     original_read = A._read_event_csv_from_file
-    A._read_event_csv_from_file = lambda slug: (reads.append(slug), original_read(slug))[1]
+    A._read_event_csv_from_file = lambda slug, club_slug=None: (reads.append(slug), original_read(slug, club_slug))[1]
     try:
         client.get(f"/events/{TEST_SLUG}")
         post(client, f"/events/{TEST_SLUG}/download",

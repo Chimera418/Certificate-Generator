@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Clubs &mdash; Superadmin</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <header class="appbar">
+      <a href="{{ url_for('admin_clubs') }}" class="appbar__brand">
+        <span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="5"/><path d="M9 13.5 8 21l4-2 4 2-1-7.5"/></svg></span>
+        Certificate Portal <span style="color:var(--faint);font-weight:500">· Admin</span>
+      </a>
+      <div class="appbar__spacer"></div>
+      <a href="{{ url_for('admin_logs') }}" class="appbar__link">Logs</a>
+      <a href="{{ url_for('admin_dashboard') }}" class="appbar__link">Legacy events</a>
+      <form action="{{ url_for('admin_logout') }}" method="post" style="margin:0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <button type="submit" class="button-link secondary">Sign out</button>
+      </form>
+    </header>
+
+    <main class="wrap wrap--wide">
+      <div class="page-head">
+        <div class="page-head__text">
+          <h1>Clubs</h1>
+          <p class="sub">Approve registrations, reset passwords, and set storage quotas.</p>
+        </div>
+      </div>
+
+      {% set approved = clubs | selectattr('status', 'equalto', 'approved') | list | length %}
+      {% set pending = clubs | selectattr('status', 'equalto', 'pending') | list | length %}
+      <section class="stats">
+        <div class="stat"><div class="stat__label">Total clubs</div><div class="stat__value">{{ clubs|length }}</div></div>
+        <div class="stat"><div class="stat__label">Approved</div><div class="stat__value">{{ approved }}</div></div>
+        <div class="stat"><div class="stat__label">Pending</div><div class="stat__value">{{ pending }}</div></div>
+      </section>
+
+      {% if clubs %}
+      <div class="panel" style="padding:var(--space-4) var(--space-5)">
+        <div class="table-scroll">
+          <table class="dtable">
+            <thead><tr><th>Club</th><th>Address</th><th>Status</th><th>Quota</th><th></th></tr></thead>
+            <tbody>
+            {% for club in clubs %}
+            <tr>
+              <td>{{ club.name }}</td>
+              <td><code class="addr">{{ club.slug }}</code></td>
+              <td><span class="pill pill--{{ 'live' if club.status == 'approved' else club.status }}">
+                {% if club.status == 'approved' %}<span class="dot"></span>{% endif %}{{ club.status }}</span></td>
+              <td style="font-family:var(--data);color:var(--muted);font-variant-numeric:tabular-nums">{{ club.quota_bytes // (1024*1024) }} MB</td>
+              <td>
+                <div class="cell-actions">
+                  {% if club.status != 'approved' %}
+                  <form action="{{ url_for('admin_set_club_status', club_id=club.id) }}" method="post" style="margin:0">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                    <input type="hidden" name="status" value="approved" />
+                    <button type="submit">Approve</button>
+                  </form>
+                  {% endif %}
+                  {% if club.status != 'suspended' %}
+                  <form action="{{ url_for('admin_set_club_status', club_id=club.id) }}" method="post" style="margin:0">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                    <input type="hidden" name="status" value="suspended" />
+                    <button type="submit" class="button-link secondary">Suspend</button>
+                  </form>
+                  {% endif %}
+                  <form action="{{ url_for('admin_set_club_quota', club_id=club.id) }}" method="post" class="inline-set" style="margin:0">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                    <input type="number" name="quota_mb" min="1" placeholder="MB" aria-label="Quota in MB" />
+                    <button type="submit" class="button-link secondary">Set</button>
+                  </form>
+                  <form action="{{ url_for('admin_reset_club_password', club_id=club.id) }}" method="post" class="inline-set" style="margin:0">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                    <input type="password" name="password" placeholder="new password" minlength="8" aria-label="New password" />
+                    <button type="submit" class="button-link secondary">Reset</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% else %}
+      <div class="empty">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 21v-2a4 4 0 0 0-8 0v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <p>No clubs have registered yet.</p>
+      </div>
+      {% endif %}
+    </main>
+  </body>
+</html>

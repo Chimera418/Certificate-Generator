@@ -108,7 +108,7 @@ try:
             A.load_event(TEST_SLUG).get("text_x"))
 
     # ── safe methods are untouched ──────────────────────────────────────────
-    r.check("GET is not blocked", client.get(f"/events/{TEST_SLUG}").status_code == 200)
+    r.check("GET is not blocked", client.get(f"/events/{TEST_SLUG}", follow_redirects=True).status_code == 200)
     r.check("GET /healthz is not blocked", client.get("/healthz").status_code == 200)
 
     # ── session handling around login ───────────────────────────────────────
@@ -154,12 +154,11 @@ try:
     # ── rendered forms actually carry the field ─────────────────────────────
     admin = admin_client()
     pages = {
-        "event page": client.get(f"/events/{TEST_SLUG}").data,
+        "event page": client.get(f"/events/{TEST_SLUG}", follow_redirects=True).data,
         "admin login": A.app.test_client().get("/admin/login").data,
         "admin dashboard": admin.get("/admin").data,
         "admin event editor": admin.get(f"/admin/events/{TEST_SLUG}").data,
         "admin logs": admin.get("/admin/logs").data,
-        "coordinate editor": admin.get(f"/admin/events/{TEST_SLUG}/coordinates").data,
         "email form": admin.get(f"/admin/events/{TEST_SLUG}/send_emails").data,
     }
     for label, html in pages.items():
@@ -168,6 +167,18 @@ try:
         fields = text.count('name="csrf_token"')
         r.check(f"{label}: every POST form carries a token",
                 forms > 0 and fields >= forms, (forms, fields))
+
+    # The placement editor saves over fetch, not a <form>, so it carries its token
+    # for the X-CSRF-Token header instead of a hidden field. The token must be
+    # present in the page, and the /fields endpoint must reject a save without it.
+    editor = admin.get(f"/admin/events/{TEST_SLUG}/coordinates").data.decode("utf-8", "replace")
+    token = csrf(admin)
+    r.check("coordinate editor embeds the CSRF token for its fetch save", token in editor, token[:8])
+    unprotected = admin.post(
+        f"/admin/events/{TEST_SLUG}/fields", data='{"fields": []}',
+        content_type="application/json", headers={"X-Requested-With": "XMLHttpRequest"})
+    r.check("the field-save endpoint refuses a POST with no token", unprotected.status_code == 400,
+            unprotected.status_code)
 finally:
     teardown_scratch(scratch)
 

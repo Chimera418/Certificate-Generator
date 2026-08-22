@@ -17,7 +17,7 @@
         <p class="error">{{ error }}</p>
         {% endif %}
 
-        <form action="{{ url_for('download_certificate', slug=event.slug) }}" method="post" class="form">
+        <form action="{{ download_action }}" method="post" class="form">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
 
           {% if event.validation_type in ['player_team', 'name_only', 'email', 'badge_id'] %}
@@ -81,7 +81,8 @@
             {% endfor %}
           {% endif %}
 
-          <label for="cert_name">Name to print on the certificate</label>
+          {% if has_name_input %}
+          <label for="cert_name">{{ name_label or "Name to print on the certificate" }}</label>
           <input
             id="cert_name"
             name="cert_name"
@@ -90,6 +91,17 @@
             autocomplete="off"
             required
           />
+          {% endif %}
+
+          {% for field in extra_input_fields %}
+          <label for="field_{{ field.id }}">{{ field.label }}</label>
+          <input
+            id="field_{{ field.id }}"
+            name="field_{{ field.id }}"
+            type="text"
+            autocomplete="off"
+          />
+          {% endfor %}
 
           <button type="submit">Generate certificate</button>
         </form>
