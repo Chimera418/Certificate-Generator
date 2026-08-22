@@ -206,6 +206,12 @@ textarea:focus-visible {
   padding: 3rem var(--gutter) 2rem;
 }
 
+/* Participant/error pages: a full-height column so .page and the footer together
+   fill the viewport exactly. Without this, .page is 100vh AND the footer sits after
+   it, so every page was 100vh + footer tall - a scrollbar over mostly-empty space. */
+.sheet { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; }
+.sheet .page { flex: 1 0 auto; min-height: 0; }
+
 .card {
   width: 100%;
   max-width: 27rem;
