@@ -64,3 +64,32 @@ services:
         sync: false
       - key: KV_REST_API_TOKEN
         sync: false
+
+  # ── Keep-alive cron ──────────────────────────────────────────────────────────
+  # Pings /keepalive every 12 minutes so Supabase Storage and Upstash Redis
+  # never go idle. Free Supabase projects pause after ~7 days of inactivity;
+  # this ensures they're touched at least 120 times a day.
+  #
+  # Set SERVICE_URL in the Render dashboard to your web service's public URL,
+  # e.g. https://certificate-generator.onrender.com
+  #
+  # The cron itself runs on Render's free plan (no persistent disk needed).
+  - type: cron
+    name: keepalive-cron
+    env: python
+    # Every 12 minutes, all day, every day.
+    schedule: "*/12 * * * *"
+    buildCommand: "echo 'no build needed'"
+    startCommand: >
+      python -c "
+      import urllib.request, os, sys;
+      url = os.environ.get('SERVICE_URL', '').rstrip('/') + '/keepalive';
+      req = urllib.request.Request(url);
+      resp = urllib.request.urlopen(req, timeout=30);
+      body = resp.read().decode();
+      print(body);
+      sys.exit(0 if resp.status in (200, 207) else 1)
+      "
+    envVars:
+      - key: SERVICE_URL
+        value: "https://certificate-generator-y4r1.onrender.com"

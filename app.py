@@ -502,6 +502,21 @@ def _kv_delete_key(key: str) -> None:
 		return
 
 
+def _kv_ping() -> None:
+	"""Send a PING to Upstash via the REST API so the database stays active.
+
+	Upstash Redis uses the REST endpoint ``/ping`` which returns
+	``{"result": "PONG"}`` on success. We raise on anything other than a
+	successful round-trip so callers can distinguish "disabled" from "error".
+	"""
+	url = f"{KV_REST_API_URL.rstrip('/')}/ping"
+	req = urlrequest.Request(url, headers={"Authorization": f"Bearer {KV_REST_API_TOKEN}"})
+	with urlrequest.urlopen(req, timeout=5) as response:
+		payload = json.loads(response.read().decode("utf-8"))
+	if payload.get("result") != "PONG":
+		raise RuntimeError(f"Unexpected Upstash PING response: {payload!r}")
+
+
 # ─── Supabase Storage ─────────────────────────────────────────────────────────
 
 def _supabase_enabled() -> bool:
@@ -3793,9 +3808,10 @@ def healthz():
 	"""
 	Keep-alive endpoint for the warm-up cron.
 
-	It deliberately touches Supabase: free Supabase projects pause after about a
-	week of inactivity, and the app only reads storage on a cache miss, so pinging
-	Flask alone would not be enough to keep the storage project awake.
+	It deliberately touches Supabase Storage and Upstash Redis:
+	  - Free Supabase projects pause after ~1 week of inactivity; pinging Flask
+	    alone is not enough because templates live in Storage, not the DB.
+	  - Upstash free-tier databases also go idle; a periodic PING prevents that.
 	"""
 	storage = "disabled"
 	if _supabase_enabled():
@@ -3804,7 +3820,73 @@ def healthz():
 			storage = "ok"
 		except Exception:
 			storage = "error"
-	return jsonify({"ok": True, "storage": storage})
+
+	kv = "disabled"
+	if _kv_enabled():
+		try:
+			_kv_ping()
+			kv = "ok"
+		except Exception:
+			kv = "error"
+
+	return jsonify({"ok": True, "storage": storage, "kv": kv})
+
+
+@app.route("/keepalive", methods=["GET"])
+def keepalive():
+	"""
+	Explicit keep-alive endpoint – mirrors the response shape of the
+	bebestmaple/supabase-keep-alive reference project.
+
+	Pings every configured backing service and returns a structured JSON
+	report so a cron monitor can distinguish partial failures:
+
+	  GET /keepalive
+	  -> {"status": "success", "results": [{"name": ..., "status": ..., "message": ...}, ...]}
+
+	HTTP 200 means every ping succeeded; 207 means at least one succeeded;
+	500 means all failed.  The endpoint never raises – it always returns JSON.
+	"""
+	results = []
+
+	# ── Supabase Storage ──────────────────────────────────────────────────────
+	if _supabase_enabled():
+		try:
+			_supabase_ping()
+			results.append({"name": "supabase_storage", "status": "ok", "message": "pong"})
+		except Exception as exc:
+			results.append({"name": "supabase_storage", "status": "error", "message": str(exc)})
+	else:
+		results.append({"name": "supabase_storage", "status": "disabled", "message": "SUPABASE_URL / SUPABASE_SERVICE_KEY not set"})
+
+	# ── Upstash Redis (KV) ────────────────────────────────────────────────────
+	if _kv_enabled():
+		try:
+			_kv_ping()
+			results.append({"name": "upstash_kv", "status": "ok", "message": "PONG"})
+		except Exception as exc:
+			results.append({"name": "upstash_kv", "status": "error", "message": str(exc)})
+	else:
+		results.append({"name": "upstash_kv", "status": "disabled", "message": "KV_REST_API_URL / KV_REST_API_TOKEN not set"})
+
+	ok_count = sum(1 for r in results if r["status"] == "ok")
+	total_active = sum(1 for r in results if r["status"] != "disabled")
+
+	if total_active == 0:
+		# Nothing configured – still return 200 (app itself is healthy)
+		overall = "disabled"
+		http_status = 200
+	elif ok_count == total_active:
+		overall = "success"
+		http_status = 200
+	elif ok_count > 0:
+		overall = "partial_failure"
+		http_status = 207
+	else:
+		overall = "all_failure"
+		http_status = 500
+
+	return jsonify({"status": overall, "results": results}), http_status
 
 
 @app.route("/assets/fonts/<font_key>.ttf", methods=["GET"])
@@ -3827,6 +3909,65 @@ def font_asset(font_key: str):
 def montserrat_bold_font():
 	"""Backward-compatible route for existing CSS references."""
 	return font_asset(DEFAULT_FONT_KEY)
+
+
+# ─── In-process keep-alive thread ────────────────────────────────────────────
+#
+# Pings Supabase Storage and Upstash Redis every 12 minutes from inside the
+# web process. This prevents free-tier idle-pauses without requiring a separate
+# cron dyno.
+#
+# Environment controls:
+#   KEEPALIVE_INTERVAL_SEC  — seconds between pings (default: 720 = 12 min)
+#   KEEPALIVE_THREAD        — set to "0" / "false" to disable the thread
+#                             (do this when you use the Render cron service)
+#
+# The thread is a daemon so gunicorn shutdown is never blocked by it.
+
+_KEEPALIVE_INTERVAL_SEC = _env_int("KEEPALIVE_INTERVAL_SEC", 720)  # 12 minutes
+_KEEPALIVE_THREAD_ENABLED = os.environ.get(
+	"KEEPALIVE_THREAD", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _keepalive_worker() -> None:
+	"""Background daemon thread: ping every backing service periodically."""
+	# Wait one full interval before the first ping so the worker has time to
+	# fully start (Supabase client init, gunicorn fork, etc.).
+	time.sleep(_KEEPALIVE_INTERVAL_SEC)
+	while True:
+		# ── Supabase Storage ──────────────────────────────────────────────────
+		if _supabase_enabled():
+			try:
+				_supabase_ping()
+				log_event("keepalive", "supabase_storage=ok")
+			except Exception as exc:
+				log_event("keepalive", f"supabase_storage=error: {exc}")
+
+		# ── Upstash Redis (KV) ────────────────────────────────────────────────
+		if _kv_enabled():
+			try:
+				_kv_ping()
+				log_event("keepalive", "upstash_kv=ok")
+			except Exception as exc:
+				log_event("keepalive", f"upstash_kv=error: {exc}")
+
+		time.sleep(_KEEPALIVE_INTERVAL_SEC)
+
+
+if _KEEPALIVE_THREAD_ENABLED:
+	_keepalive_thread = threading.Thread(
+		target=_keepalive_worker,
+		name="keepalive",
+		daemon=True,  # won't block gunicorn shutdown
+	)
+	_keepalive_thread.start()
+	print(
+		f"[keepalive] background thread started "
+		f"(interval={_KEEPALIVE_INTERVAL_SEC}s / "
+		f"{_KEEPALIVE_INTERVAL_SEC // 60}min). "
+		f"Set KEEPALIVE_THREAD=0 to disable."
+	)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
