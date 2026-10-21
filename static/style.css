@@ -1414,8 +1414,8 @@ code {
    ========================================================================== */
 
 :root {
-  --font-display: "Archivo", var(--font);
-  --data: "IBM Plex Mono", var(--font-mono);
+  --font-display: var(--font);
+  --data: var(--font-mono);
 }
 
 .appbar {

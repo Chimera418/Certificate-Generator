@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import gzip
 import hashlib
 import hmac
 import json
@@ -82,6 +83,51 @@ app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", ""
 # cookie with this rolling lifetime (refreshed each request) instead of dying when
 # the browser closes. Auth stays in the HTTPOnly cookie - never in localStorage.
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+
+_FAVICON_SVG = (
+	b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+	b'stroke="%23fafafa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+	b'<circle cx="12" cy="9" r="5"/><path d="M9 13.5 8 21l4-2 4 2-1-7.5"/></svg>'
+)
+
+
+@app.route("/favicon.ico", methods=["GET"])
+def favicon():
+	response = make_response(_FAVICON_SVG, 200)
+	response.mimetype = "image/svg+xml"
+	response.cache_control.public = True
+	response.cache_control.max_age = 86400 * 30
+	return response
+
+
+@app.after_request
+def _optimize_response(response):
+	"""Apply lightweight optimizations: static asset caching and dynamic gzip compression."""
+	if request.path.startswith("/static/"):
+		response.cache_control.public = True
+		response.cache_control.max_age = 31536000
+		response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+
+	if (
+		response.status_code >= 200
+		and response.status_code < 300
+		and "gzip" in request.headers.get("Accept-Encoding", "").lower()
+		and "Content-Encoding" not in response.headers
+	):
+		content_type = response.content_type.split(";")[0].strip().lower()
+		if content_type.startswith(("text/", "application/json", "application/javascript", "image/svg+xml")):
+			if response.direct_passthrough:
+				response.direct_passthrough = False
+			data = response.get_data()
+			if len(data) >= 500:
+				compressed = gzip.compress(data, compresslevel=6)
+				if len(compressed) < len(data):
+					response.set_data(compressed)
+					response.headers["Content-Encoding"] = "gzip"
+					response.headers["Content-Length"] = len(compressed)
+					response.headers["Vary"] = "Accept-Encoding"
+
+	return response
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_EVENTS_DIR = os.path.join(BASE_DIR, "events")
@@ -179,16 +225,16 @@ _EVENT_CSV_CACHE_TTL_SEC = 30.0
 # thing that actually runs out. With many clubs cycling many distinct templates
 # through one cache, that guess is what OOM-kills the worker.
 TEMPLATE_CACHE_MAX_BYTES = _env_int("TEMPLATE_CACHE_MAX_BYTES", 96 * 1024 * 1024)
-_TEMPLATE_CACHE_MAX = _env_int("TEMPLATE_CACHE_MAX", 6)
-_RENDER_CACHE_MAX = _env_int("RENDER_CACHE_MAX", 6)
-_FONT_CACHE_MAX = 20
+_TEMPLATE_CACHE_MAX = _env_int("TEMPLATE_CACHE_MAX", 12)
+_RENDER_CACHE_MAX = _env_int("RENDER_CACHE_MAX", 128)
+_FONT_CACHE_MAX = 50
 
 # Encoding dominates render time: for an 8.7 MP page, drawing the name takes ~4 ms
 # while the PNG encode takes ~320 ms at Pillow's default compression. So the screen
 # preview is downscaled and sent as JPEG, and the download drops to a lighter PNG
 # compression level - which, with the alpha channel gone, is still a smaller file.
-PREVIEW_MAX_WIDTH = _env_int("PREVIEW_MAX_WIDTH", 1200)
-PREVIEW_JPEG_QUALITY = _env_int("PREVIEW_JPEG_QUALITY", 90)
+PREVIEW_MAX_WIDTH = _env_int("PREVIEW_MAX_WIDTH", 960)
+PREVIEW_JPEG_QUALITY = _env_int("PREVIEW_JPEG_QUALITY", 82)
 DOWNLOAD_PNG_COMPRESS_LEVEL = _env_int("DOWNLOAD_PNG_COMPRESS_LEVEL", 3)
 
 # Download format, per event. PNG at any compression level costs 250-530 ms for a
@@ -224,36 +270,42 @@ class _ByteCappedCache:
 		self.max_entries = max_entries
 		self.total_bytes = 0
 		self._entries: "OrderedDict[str, tuple]" = OrderedDict()
+		self._lock = threading.Lock()
 
 	def get(self, key: str):
-		entry = self._entries.get(key)
-		if entry is None:
-			return None
-		self._entries.move_to_end(key)
-		return entry[0]
+		with self._lock:
+			entry = self._entries.get(key)
+			if entry is None:
+				return None
+			self._entries.move_to_end(key)
+			return entry[0]
 
 	def put(self, key: str, value, nbytes: int) -> None:
-		previous = self._entries.pop(key, None)
-		if previous is not None:
-			self.total_bytes -= previous[1]
-		self._entries[key] = (value, nbytes)
-		self.total_bytes += nbytes
-		# An entry larger than the whole budget is evicted immediately rather than
-		# held: better to re-decode it than to blow the budget it was sized against.
-		while self._entries and (self.total_bytes > self.max_bytes
-								 or len(self._entries) > self.max_entries):
-			_, evicted = self._entries.popitem(last=False)
-			self.total_bytes -= evicted[1]
+		with self._lock:
+			previous = self._entries.pop(key, None)
+			if previous is not None:
+				self.total_bytes -= previous[1]
+			self._entries[key] = (value, nbytes)
+			self.total_bytes += nbytes
+			# An entry larger than the whole budget is evicted immediately rather than
+			# held: better to re-decode it than to blow the budget it was sized against.
+			while self._entries and (self.total_bytes > self.max_bytes
+									 or len(self._entries) > self.max_entries):
+				_, evicted = self._entries.popitem(last=False)
+				self.total_bytes -= evicted[1]
 
 	def clear(self) -> None:
-		self._entries.clear()
-		self.total_bytes = 0
+		with self._lock:
+			self._entries.clear()
+			self.total_bytes = 0
 
 	def __len__(self) -> int:
-		return len(self._entries)
+		with self._lock:
+			return len(self._entries)
 
 	def __contains__(self, key: str) -> bool:
-		return key in self._entries
+		with self._lock:
+			return key in self._entries
 
 
 # Every cache key embeds the template version and render settings, so a replaced
@@ -263,18 +315,23 @@ _RENDERED_CERT_CACHE: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
 _FONT_CACHE: "OrderedDict[str, ImageFont.FreeTypeFont | ImageFont.ImageFont]" = OrderedDict()
 
 
+_CACHE_LOCK = threading.Lock()
+
+
 def _cache_get(cache: OrderedDict, key: str):
-	if key not in cache:
-		return None
-	cache.move_to_end(key)
-	return cache[key]
+	with _CACHE_LOCK:
+		if key not in cache:
+			return None
+		cache.move_to_end(key)
+		return cache[key]
 
 
 def _cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
-	cache[key] = value
-	cache.move_to_end(key)
-	while len(cache) > max_size:
-		cache.popitem(last=False)
+	with _CACHE_LOCK:
+		cache[key] = value
+		cache.move_to_end(key)
+		while len(cache) > max_size:
+			cache.popitem(last=False)
 
 
 # ─── Render concurrency ───────────────────────────────────────────────────────
@@ -327,7 +384,7 @@ RENDER_MAX_CONCURRENCY_PER_TENANT = _env_int(
 	"RENDER_MAX_CONCURRENCY_PER_TENANT", max(1, RENDER_MAX_CONCURRENCY // 2))
 # Bounded so a spike sheds load with a 503 instead of piling up until gunicorn's
 # --timeout kills the worker and takes every in-flight request with it.
-RENDER_QUEUE_TIMEOUT_SEC = _env_int("RENDER_QUEUE_TIMEOUT_SEC", 30)
+RENDER_QUEUE_TIMEOUT_SEC = _env_int("RENDER_QUEUE_TIMEOUT_SEC", 60)
 
 _RENDER_SLOTS = threading.BoundedSemaphore(RENDER_MAX_CONCURRENCY)
 _TENANT_SLOTS: dict[str, threading.BoundedSemaphore] = {}
@@ -2935,14 +2992,19 @@ def download_file(token: str):
 		return render_busy_response()
 	if rendered is None:
 		return ("Not found", 404)
-	image_bytes, _, mimetype = rendered
+	image_bytes, etag, mimetype = rendered
 
-	return send_file(
+	response = send_file(
 		BytesIO(image_bytes),
 		mimetype=mimetype,
 		as_attachment=True,
 		download_name=safe_download_name(display_name(values), slug, mimetype),
+		etag=etag,
 	)
+	response.cache_control.private = True
+	response.cache_control.max_age = 300
+	response.cache_control.must_revalidate = True
+	return response
 
 
 # ─── Admin routes ─────────────────────────────────────────────────────────────
