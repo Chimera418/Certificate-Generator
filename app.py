@@ -2016,7 +2016,13 @@ def normalize_fields(config: dict) -> list:
 	for field in fields:
 		if field["depends_on"] not in valid_ids:
 			field["depends_on"] = None
-	return fields or [_legacy_name_field(config)]
+	res = fields or [_legacy_name_field(config)]
+	if config.get("validation_type") == "none":
+		for f in res:
+			if f["source"] == "csv":
+				f["source"] = "input"
+				f["column"] = ""
+	return res
 
 
 def _json_for_script(value) -> str:
@@ -2095,7 +2101,12 @@ def resolve_field_values(fields: list, matched_rows: list,
 					"Please also select your name so \u201c%s\u201d can be filled in "
 					"\u2014 it differs between the matching entries." % field["label"]
 				)
-			values[field["id"]] = matched_rows[0].get(column, "") if matched_rows else ""
+			if matched_rows:
+				values[field["id"]] = matched_rows[0].get(column, "")
+			elif inputs.get(field["id"]):
+				values[field["id"]] = (inputs.get(field["id"], "") or "").strip()
+			else:
+				values[field["id"]] = ""
 	return values, None
 
 
@@ -2651,8 +2662,8 @@ def download_certificate(slug: str):
 	# that have no input fields configured, we always slot cert_name as "name".
 	if primary_id and not inputs.get(primary_id):
 		inputs[primary_id] = cert_name
-	elif validation_type == "none" and cert_name and not inputs.get("name"):
-		inputs["name"] = cert_name
+	if validation_type == "none" and cert_name:
+		inputs.setdefault("name", cert_name)
 	values, resolve_error = resolve_field_values(fields, matched_rows, inputs)
 	if resolve_error:
 		return render_template("event.html", **event_form_context(config, slug, resolve_error)), 400
@@ -2712,8 +2723,8 @@ def club_download_certificate(club_slug: str, event_slug: str):
 	# that have no input fields configured, we always slot cert_name as "name".
 	if primary_id and not inputs.get(primary_id):
 		inputs[primary_id] = cert_name
-	elif validation_type == "none" and cert_name and not inputs.get("name"):
-		inputs["name"] = cert_name
+	if validation_type == "none" and cert_name:
+		inputs.setdefault("name", cert_name)
 	values, resolve_error = resolve_field_values(fields, matched_rows, inputs)
 	if resolve_error:
 		return form_error(resolve_error)
