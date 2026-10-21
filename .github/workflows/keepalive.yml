@@ -1,0 +1,100 @@
+name: Keep Supabase Alive
+
+on:
+  schedule:
+    # Runs at 9:00 AM UTC every Monday and Thursday
+    - cron: "0 9 * * 1,4"
+  workflow_dispatch: # Allows manual triggering from the GitHub UI
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Supabase Databases
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_CONFIGS: ${{ secrets.SUPABASE_CONFIGS }}
+        run: |
+          node -e "
+          (async () => {
+            try {
+              let configs = [];
+              
+              if (process.env.SUPABASE_CONFIGS) {
+                configs = JSON.parse(process.env.SUPABASE_CONFIGS);
+              } else if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+                configs = [{
+                  name: 'Primary Database',
+                  url: process.env.SUPABASE_URL,
+                  key: process.env.SUPABASE_ANON_KEY
+                }];
+              } else {
+                throw new Error('Missing SUPABASE_CONFIGS or SUPABASE_URL/SUPABASE_ANON_KEY secrets.');
+              }
+
+              if (!Array.isArray(configs) || configs.length === 0) {
+                throw new Error('No valid database configurations found.');
+              }
+
+              console.log('Pinging', configs.length, 'database(s)...');
+              console.log('Timestamp:', new Date().toISOString());
+              console.log('-'.repeat(60));
+              
+              let successCount = 0;
+              let failCount = 0;
+
+              for (let i = 0; i < configs.length; i++) {
+                const config = configs[i];
+                const dbName = config.name || 'Database ' + (i + 1);
+                
+                try {
+                  console.log('\n[' + (i + 1) + '/' + configs.length + '] ' + dbName);
+                  console.log('URL:', config.url);
+                  
+                  if (!config.url || !config.key) {
+                    throw new Error('Missing url or key for ' + dbName);
+                  }
+
+                  const startTime = Date.now();
+                  const response = await fetch(config.url + '/rest/v1/', {
+                    headers: {
+                      'apikey': config.key,
+                      'Authorization': 'Bearer ' + config.key
+                    }
+                  });
+                  const duration = Date.now() - startTime;
+
+                  if (!response.ok && response.status !== 404 && response.status !== 401) {
+                    throw new Error('Server returned status ' + response.status);
+                  }
+                  
+                  console.log('Success! Response time:', duration + 'ms');
+                  successCount++;
+                  
+                } catch (err) {
+                  console.error('Failed:', err.message);
+                  failCount++;
+                }
+              }
+
+              console.log('\n' + '-'.repeat(60));
+              console.log('Summary:');
+              console.log('  Successful:', successCount);
+              console.log('  Failed:', failCount);
+              console.log('  Total:', configs.length);
+              
+              if (failCount > 0) {
+                console.error('\nSome databases failed to ping');
+                process.exit(1);
+              }
+              
+              console.log('\nAll databases pinged successfully!');
+              
+            } catch (err) {
+              console.error('\nFatal error:', err.message);
+              process.exit(1);
+            }
+          })();
+          "

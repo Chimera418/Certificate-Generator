@@ -1726,10 +1726,11 @@ def event_form_context(config: dict, slug: str, error: str | None = None,
 		"registration_placeholder": registration_placeholder,
 		"name_label": name_label,
 		"extra_input_fields": extra_input_fields,
-		# The "name to print" box only makes sense when a field is filled by participant
-		# input. When the name is read from the participants file (csv) it is pulled from
-		# the matched row, so the box is neither shown nor required.
-		"has_name_input": primary_id is not None,
+		# The "name to print" box is shown when:
+		#   - a field is filled by participant input (primary_id is set), OR
+		#   - validation_type is "none" (no roster check; the user simply types the
+		#     name they want printed, so we always need the box in that case).
+		"has_name_input": primary_id is not None or validation_type == "none",
 		"download_action": download_action or url_for("download_certificate", slug=slug),
 		"error": error,
 	}
@@ -2625,10 +2626,11 @@ def download_certificate(slug: str):
 	validation_type = config.get("validation_type", "player_team")
 	primary_id, _ = participant_input_fields(config)
 	cert_name = (request.form.get("cert_name", "") or "").strip()
-	# cert_name is only needed when a field is filled by participant input; a
-	# csv-sourced name is read from the matched row, so it is not asked for.
-	if primary_id and not cert_name:
-		return render_template("event.html", **event_form_context(config, slug, "Please fill all fields.")), 400
+	# cert_name is required when a field is participant-input OR when validation is
+	# "none" (user types whatever name they want on the cert; no roster check).
+	needs_cert_name = primary_id is not None or validation_type == "none"
+	if needs_cert_name and not cert_name:
+		return render_template("event.html", **event_form_context(config, slug, "Please enter your name.")), 400
 	matched_rows, validation_error = validate_participant_submission(slug, config, request.form)
 	if validation_error:
 		return render_template("event.html", **event_form_context(config, slug, validation_error)), 400
@@ -2645,9 +2647,12 @@ def download_certificate(slug: str):
 			posted = request.form.get("field_" + field["id"])
 			inputs[field["id"]] = (posted or "").strip()
 	# The primary name box (cert_name) fills the primary input field unless that
-	# field already got a dedicated field_<id> value.
+	# field already got a dedicated field_<id> value. For "none" validation events
+	# that have no input fields configured, we always slot cert_name as "name".
 	if primary_id and not inputs.get(primary_id):
 		inputs[primary_id] = cert_name
+	elif validation_type == "none" and cert_name and not inputs.get("name"):
+		inputs["name"] = cert_name
 	values, resolve_error = resolve_field_values(fields, matched_rows, inputs)
 	if resolve_error:
 		return render_template("event.html", **event_form_context(config, slug, resolve_error)), 400
@@ -2683,9 +2688,13 @@ def club_download_certificate(club_slug: str, event_slug: str):
 													club_slug=storage_club)), status
 
 	primary_id, _ = participant_input_fields(config)
+	validation_type = config.get("validation_type", "player_team")
 	cert_name = (request.form.get("cert_name", "") or "").strip()
-	if primary_id and not cert_name:
-		return form_error("Please fill all fields.")
+	# cert_name is required when a field is participant-input OR when validation is
+	# "none" (user types whatever name they want on the cert; no roster check).
+	needs_cert_name = primary_id is not None or validation_type == "none"
+	if needs_cert_name and not cert_name:
+		return form_error("Please enter your name.")
 	matched_rows, validation_error = validate_participant_submission(event_slug, config, request.form, club_slug=storage_club)
 	if validation_error:
 		return form_error(validation_error)
@@ -2698,8 +2707,13 @@ def club_download_certificate(club_slug: str, event_slug: str):
 		if field["source"] == "input":
 			posted = request.form.get("field_" + field["id"])
 			inputs[field["id"]] = (posted or "").strip()
+	# The primary name box (cert_name) fills the primary input field unless that
+	# field already got a dedicated field_<id> value. For "none" validation events
+	# that have no input fields configured, we always slot cert_name as "name".
 	if primary_id and not inputs.get(primary_id):
 		inputs[primary_id] = cert_name
+	elif validation_type == "none" and cert_name and not inputs.get("name"):
+		inputs["name"] = cert_name
 	values, resolve_error = resolve_field_values(fields, matched_rows, inputs)
 	if resolve_error:
 		return form_error(resolve_error)
