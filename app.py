@@ -825,38 +825,114 @@ def _scoped_event_dir(event_slug: str, club_slug: str | None = None) -> str:
 	return os.path.join(EVENTS_DIR, club_slug, event_slug) if club_slug else _event_dir(event_slug)
 
 
-def template_ext_for(slug: str, config: dict | None = None) -> str:
+def _resolve_event_club_slug(slug: str, club_slug: str | None = None) -> str | None:
+	if club_slug:
+		return club_slug
+	try:
+		row = repo().find_event_globally(slug)
+		if row and row.get("club_id"):
+			club = repo().get_club_by_id(row["club_id"])
+			if club and club.get("slug"):
+				return club["slug"]
+	except Exception:
+		pass
+	return None
+
+
+def template_ext_for(slug: str, config: dict | None = None,
+					 club_slug: str | None = None) -> str:
 	"""Extension recorded on the config, falling back to whatever is on local disk."""
 	recorded = (config or {}).get("template_ext")
 	if isinstance(recorded, str) and recorded.lower() in TEMPLATE_EXTENSIONS:
 		return recorded.lower()
+	club_slug = _resolve_event_club_slug(slug, club_slug)
+	scoped = _scoped_event_dir(slug, club_slug)
 	for ext in TEMPLATE_EXTENSIONS:
-		if os.path.exists(os.path.join(_event_dir(slug), f"template{ext}")):
+		if os.path.exists(os.path.join(scoped, f"template{ext}")):
 			return ext
+	if not club_slug:
+		for ext in TEMPLATE_EXTENSIONS:
+			if os.path.exists(os.path.join(_event_dir(slug), f"template{ext}")):
+				return ext
 	return ".png"
 
 
-def template_version_for(slug: str, config: dict | None = None) -> str:
+def template_version_for(slug: str, config: dict | None = None,
+						 club_slug: str | None = None) -> str:
 	"""Cache-busting token for a template. Changes whenever the template changes."""
 	version = (config or {}).get("template_version")
-	if isinstance(version, str) and version:
+	if isinstance(version, str) and version and version.lower() not in ("none", "null", "false", ""):
 		return version
+	club_slug = _resolve_event_club_slug(slug, club_slug)
+	if club_slug and (not config or not config.get("template_version")):
+		try:
+			row = repo().find_event_globally(slug)
+			if row and row.get("template_version"):
+				v = row["template_version"]
+				if isinstance(v, str) and v.lower() not in ("none", "null", "false", ""):
+					return v
+		except Exception:
+			pass
 	# Events created before versioning fall back to the local file mtime.
+	scoped = _scoped_event_dir(slug, club_slug)
+	for ext in TEMPLATE_EXTENSIONS:
+		p = os.path.join(scoped, f"template{ext}")
+		try:
+			return str(int(os.path.getmtime(p)))
+		except OSError:
+			pass
 	try:
 		return str(int(os.path.getmtime(_event_template_path(slug))))
 	except OSError:
 		return "none"
 
 
-def has_template(slug: str, config: dict | None = None) -> bool:
-	if (config or {}).get("template_version"):
-		return True
-	return os.path.exists(_event_template_path(slug))
+def has_template(slug: str, config: dict | None = None,
+				 club_slug: str | None = None) -> bool:
+	if config is None:
+		config = _load_event_config(slug) or {}
+	version = config.get("template_version")
+	if isinstance(version, str) and version.lower() in ("none", "null", "false", ""):
+		version = None
+
+	club_slug = _resolve_event_club_slug(slug, club_slug)
+	if not version:
+		try:
+			row = repo().find_event_globally(slug)
+			if row and row.get("template_version"):
+				v = row["template_version"]
+				if isinstance(v, str) and v.lower() not in ("none", "null", "false", ""):
+					version = v
+		except Exception:
+			pass
+
+	if version:
+		if _TEMPLATE_IMAGE_CACHE.get(_template_cache_key(slug, version, club_slug)) is not None:
+			return True
+		ext = template_ext_for(slug, config, club_slug)
+		if os.path.exists(os.path.join(_scoped_event_dir(slug, club_slug), f"template{ext}")):
+			return True
+		if not club_slug and os.path.exists(_event_template_path(slug)):
+			return True
+		if _supabase_enabled():
+			return True
+		return False
+
+	scoped = _scoped_event_dir(slug, club_slug)
+	for ext in TEMPLATE_EXTENSIONS:
+		if os.path.exists(os.path.join(scoped, f"template{ext}")):
+			return True
+	if not club_slug:
+		for ext in TEMPLATE_EXTENSIONS:
+			if os.path.exists(os.path.join(_event_dir(slug), f"template{ext}")):
+				return True
+	return False
 
 
 def load_template_bytes(slug: str, config: dict | None = None,
 						club_slug: str | None = None) -> bytes | None:
-	ext = template_ext_for(slug, config)
+	club_slug = _resolve_event_club_slug(slug, club_slug)
+	ext = template_ext_for(slug, config, club_slug)
 	if _supabase_enabled():
 		# A club event lives only in the club scheme, so there is no legacy path to
 		# fall back to; a legacy event keeps its new-then-older fallback.
@@ -882,6 +958,7 @@ def load_template_bytes(slug: str, config: dict | None = None,
 def save_template_bytes(slug: str, data: bytes, ext: str,
 						club_slug: str | None = None) -> str:
 	"""Persist a template everywhere and return its new version token."""
+	club_slug = _resolve_event_club_slug(slug, club_slug)
 	if _supabase_enabled():
 		_supabase_upload(
 			_template_object_path(slug, ext, club_slug),
@@ -1084,7 +1161,8 @@ def get_template_image(slug: str, config: dict | None = None,
 	the same template_version, and a slug-only key would serve one club's template
 	for the other's certificate. A legacy (club-less) event keeps its bare key so
 	its cache behaviour is unchanged."""
-	version = template_version_for(slug, config)
+	club_slug = _resolve_event_club_slug(slug, club_slug)
+	version = template_version_for(slug, config, club_slug)
 	cache_key = _template_cache_key(slug, version, club_slug)
 	cached = _TEMPLATE_IMAGE_CACHE.get(cache_key)
 	if cached is None:
@@ -1199,6 +1277,10 @@ def _load_event_config(slug: str) -> dict | None:
 		config.setdefault("slug", row["slug"])
 		config.setdefault("name", row["name"])
 		config["active"] = row["active"]
+		if row.get("template_ext") and not config.get("template_ext"):
+			config["template_ext"] = row["template_ext"]
+		if row.get("template_version") and not config.get("template_version"):
+			config["template_version"] = row["template_version"]
 
 	if config is None and _kv_enabled():
 		try:
@@ -2466,6 +2548,28 @@ def safe_download_name(name: str, slug: str, mimetype: str = "image/png") -> str
 	return f"{cleaned}{DOWNLOAD_MIMETYPE_EXTENSIONS.get(mimetype, '.png')}"
 
 
+def detect_image_format(data: bytes) -> str | None:
+	"""Detect format ('.png', '.jpg', '.gif', '.webp') from data headers or Pillow."""
+	if not data:
+		return None
+	header = data[:12]
+	if header[:8] == b"\x89PNG\r\n\x1a\n":
+		return ".png"
+	if header[:3] == b"\xff\xd8\xff":
+		return ".jpg"
+	if header[:6] in (b"GIF87a", b"GIF89a"):
+		return ".gif"
+	if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+		return ".webp"
+	try:
+		with Image.open(BytesIO(data)) as probe:
+			fmt = (probe.format or "").upper()
+			fmt_map = {"PNG": ".png", "JPEG": ".jpg", "GIF": ".gif", "WEBP": ".webp"}
+			return fmt_map.get(fmt)
+	except Exception:
+		return None
+
+
 def _has_image_magic(data: bytes, ext: str) -> bool:
 	"""Check that the file content matches the extension it claims."""
 	header = data[:12]
@@ -3153,10 +3257,14 @@ def _event_detail(club, slug, error=None, success=None, status=200):
 	if event is None:
 		abort(404)
 	config = event.get("config") or {}
+	if event.get("template_version") and not config.get("template_version"):
+		config["template_version"] = event["template_version"]
+	if event.get("template_ext") and not config.get("template_ext"):
+		config["template_ext"] = event["template_ext"]
 	used = club_storage_bytes(club["slug"])
 	return render_template(
 		"club/event_detail.html", club=club, event=event,
-		has_template=bool(config.get("template_version")),
+		has_template=has_template(slug, config, club_slug=club["slug"]),
 		used_mb=used // (1024 * 1024), quota_mb=int(club["quota_bytes"]) // (1024 * 1024),
 		error=error, success=success), status
 
@@ -3204,12 +3312,20 @@ def club_upload_template(slug: str):
 	file = request.files.get("template_file")
 	if not file or file.filename == "":
 		return _event_detail(club, slug, error="No file selected.", status=400)
-	ext = os.path.splitext(secure_filename(file.filename).lower())[1].lower()
-	if ext not in TEMPLATE_EXTENSIONS:
-		return _event_detail(club, slug, error="Template must be PNG, JPG, GIF, or WebP.", status=400)
+	filename = secure_filename(file.filename or "").lower()
+	ext = os.path.splitext(filename)[1].lower() if filename else ""
 
 	file.stream.seek(0)
 	data = file.stream.read()
+	if not data:
+		return _event_detail(club, slug, error="Selected file is empty.", status=400)
+
+	detected_ext = detect_image_format(data)
+	if detected_ext:
+		ext = detected_ext
+	elif ext not in TEMPLATE_EXTENSIONS:
+		return _event_detail(club, slug, error="Template must be PNG, JPG, GIF, or WebP.", status=400)
+
 	# Magic-byte and decompression-bomb validation - the extension is never trusted.
 	validation_error = validate_template_upload(data, ext)
 	if validation_error:
@@ -3217,7 +3333,7 @@ def club_upload_template(slug: str):
 
 	# Quota is checked before anything is written, and a rejection stores nothing.
 	# A replacement upserts over the existing template, so net that object out.
-	old_ext = (event.get("config") or {}).get("template_ext")
+	old_ext = event.get("template_ext") or (event.get("config") or {}).get("template_ext")
 	replacing = _template_object_path(slug, old_ext, club["slug"]) if old_ext else None
 	ok, message = quota_status(club, len(data), replacing_path=replacing)
 	if not ok:
@@ -3232,6 +3348,7 @@ def club_upload_template(slug: str):
 	config["template_ext"] = ext
 	config["template_version"] = version
 	repo().update_event(club["id"], slug, config=config, template_ext=ext, template_version=version)
+	save_event_config(slug, config)
 	_invalidate_public_event(club["slug"], slug)
 	warm_template_cache_from_bytes(slug, version, data, club_slug=club["slug"])
 	return _event_detail(club, slug, success="Template uploaded.")
@@ -3510,8 +3627,9 @@ def admin_edit_event(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
+	club_slug = _resolve_event_club_slug(slug)
 	return render_template("admin/event_form.html", event=config, is_new=False, error=None,
-						   has_template=has_template(slug, config),
+						   has_template=has_template(slug, config, club_slug=club_slug),
 						   has_csv=_event_csv_exists(slug),
 						   csv_columns=csv_headers(slug))
 
@@ -3548,10 +3666,11 @@ def admin_update_config(slug: str):
 		request.form.get("download_format"),
 		config.get("download_format", DEFAULT_DOWNLOAD_FORMAT))
 	save_event_config(slug, config)
+	club_slug = _resolve_event_club_slug(slug)
 	if request.headers.get("X-Requested-With") == "XMLHttpRequest":
 		return jsonify({"ok": True, "message": "Settings saved."})
 	return render_template("admin/event_form.html", event=config, is_new=False, success="Settings saved.",
-						   error=None, has_template=has_template(slug, config),
+						   error=None, has_template=has_template(slug, config, club_slug=club_slug),
 						   has_csv=_event_csv_exists(slug),
 						   csv_columns=csv_headers(slug))
 
@@ -3564,23 +3683,49 @@ def admin_upload_template(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
+
+	club_id = None
+	club_slug = None
+	try:
+		row = repo().find_event_globally(slug)
+		if row:
+			club_id = row.get("club_id")
+			club = repo().get_club_by_id(club_id) if club_id else None
+			if club:
+				club_slug = club.get("slug")
+			if row.get("template_version") and not config.get("template_version"):
+				config["template_version"] = row["template_version"]
+			if row.get("template_ext") and not config.get("template_ext"):
+				config["template_ext"] = row["template_ext"]
+	except Exception:
+		pass
+
 	has_csv = _event_csv_exists(slug)
-	template_present = has_template(slug, config)
+	template_present = has_template(slug, config, club_slug=club_slug)
 	file = request.files.get("template_file")
 	if not file or file.filename == "":
 		return render_template("admin/event_form.html", event=config, is_new=False,
 							   error="No file selected.", has_template=template_present, has_csv=has_csv,
 							   csv_columns=csv_headers(slug)), 400
 
-	filename = secure_filename(file.filename).lower()
-	ext = os.path.splitext(filename)[1].lower()
-	if ext not in TEMPLATE_EXTENSIONS:
+	filename = secure_filename(file.filename or "").lower()
+	ext = os.path.splitext(filename)[1].lower() if filename else ""
+
+	file.stream.seek(0)
+	data = file.stream.read()
+	if not data:
+		return render_template("admin/event_form.html", event=config, is_new=False,
+				error="Selected file is empty.", has_template=template_present, has_csv=has_csv,
+				csv_columns=csv_headers(slug)), 400
+
+	detected_ext = detect_image_format(data)
+	if detected_ext:
+		ext = detected_ext
+	elif ext not in TEMPLATE_EXTENSIONS:
 		return render_template("admin/event_form.html", event=config, is_new=False,
 				error="Template must be PNG, JPG, GIF, or WebP.", has_template=template_present, has_csv=has_csv,
 				csv_columns=csv_headers(slug)), 400
 
-	file.stream.seek(0)
-	data = file.stream.read()
 	validation_error = validate_template_upload(data, ext)
 	if validation_error:
 		return render_template("admin/event_form.html", event=config, is_new=False,
@@ -3588,7 +3733,7 @@ def admin_upload_template(slug: str):
 				csv_columns=csv_headers(slug)), 400
 
 	try:
-		version = save_template_bytes(slug, data, ext)
+		version = save_template_bytes(slug, data, ext, club_slug=club_slug)
 	except Exception:
 		return render_template("admin/event_form.html", event=config, is_new=False,
 				error="Could not save the template to storage. Check the Supabase settings and try again.",
@@ -3599,8 +3744,12 @@ def admin_upload_template(slug: str):
 	# render keys embed it, so a replaced template can never be served stale.
 	config["template_ext"] = ext
 	config["template_version"] = version
+	if club_id:
+		repo().update_event(club_id, slug, config=config, template_ext=ext, template_version=version)
 	save_event_config(slug, config)
-	warm_template_cache_from_bytes(slug, version, data)
+	if club_slug:
+		_invalidate_public_event(club_slug, slug)
+	warm_template_cache_from_bytes(slug, version, data, club_slug=club_slug)
 	return render_template("admin/event_form.html", event=config, is_new=False,
 				success="Template uploaded successfully.", error=None, has_template=True, has_csv=has_csv,
 				csv_columns=csv_headers(slug))
@@ -3614,7 +3763,8 @@ def admin_upload_csv(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return redirect(url_for("admin_dashboard"))
-	template_present = has_template(slug, config)
+	club_slug = _resolve_event_club_slug(slug)
+	template_present = has_template(slug, config, club_slug=club_slug)
 	has_csv = _event_csv_exists(slug)
 	file = request.files.get("csv_file")
 	if not file or file.filename == "":
@@ -3848,14 +3998,15 @@ def admin_template_preview(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return "Not found", 404
-	data = load_template_bytes(slug, config)
+	club_slug = _resolve_event_club_slug(slug)
+	data = load_template_bytes(slug, config, club_slug=club_slug)
 	if data is None:
 		return "Template not found", 404
-	ext = template_ext_for(slug, config)
+	ext = template_ext_for(slug, config, club_slug=club_slug)
 	response = send_file(
 		BytesIO(data),
 		mimetype=TEMPLATE_CONTENT_TYPES.get(ext, "application/octet-stream"),
-		etag=template_version_for(slug, config),
+		etag=template_version_for(slug, config, club_slug=club_slug),
 	)
 	response.cache_control.private = True
 	response.cache_control.max_age = 60
@@ -3871,9 +4022,10 @@ def admin_render_preview(slug: str):
 	config = load_event(slug)
 	if config is None:
 		return "Not found", 404
+	club_slug = _resolve_event_club_slug(slug)
 	try:
 		with render_slot(slug):
-			image = get_template_image(slug, config)
+			image = get_template_image(slug, config, club_slug=club_slug)
 			if image is None:
 				return "Template not found", 404
 			metadata = build_preview_metadata(config, request.args.get("cert_name"))
